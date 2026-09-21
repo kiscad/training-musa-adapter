@@ -17,10 +17,13 @@ from __future__ import annotations
 
 __all__ = ["PATCHES", "MODULES"]
 
+from .megatron import attention
+
 # Populated as domains migrate (docs/MIGRATION_LEDGER.md tracks status):
-#   from . import platform, transformer_engine
-#   from .megatron import attention, layer_norm, rope, ssm
-#   from .transformers import rms_norm
-MODULES: tuple = ()
+#   platform, transformer_engine, megatron.layer_norm, megatron.rope,
+#   megatron.ssm, transformers.rms_norm, ...
+MODULES = (
+    attention,
+)
 
 PATCHES = tuple(patch for module in MODULES for patch in module.PATCHES)
