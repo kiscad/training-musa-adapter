@@ -17,7 +17,7 @@ from __future__ import annotations
 
 __all__ = ["PATCHES", "MODULES"]
 
-from . import platform
+from . import platform, transformer_engine
 from .megatron import attention, layer_norm
 from .transformers import rms_norm
 
@@ -25,6 +25,7 @@ from .transformers import rms_norm
 #   transformer_engine, megatron.layer_norm, megatron.rope, megatron.ssm, ...
 MODULES = (
     platform,
+    transformer_engine,
     attention,
     layer_norm,
     rms_norm,

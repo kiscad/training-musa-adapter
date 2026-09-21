@@ -15,6 +15,7 @@ import sys
 from typing import Any
 
 from ._errors import PatchTargetMissing, TrainingMusaAdaptorError
+from ._imports import find_spec_without_watchers  # noqa: F401  (re-export)
 
 __all__ = [
     "logger",
@@ -22,6 +23,7 @@ __all__ = [
     "require_attr",
     "distribution_version",
     "module_source_contains",
+    "find_spec_without_watchers",
     "normalize_distribution_name",
     "parse_version_gate",
     "check_version_gate",
@@ -86,22 +88,59 @@ def require_attr(module: Any, attribute: str, *, patch_id: str, target: str) -> 
     return owner
 
 
-def module_source_contains(module_name: str, needle: str) -> bool | None:
-    """True/False/unknown: does the installed module's source contain text?
+def module_source_contains(module_name: str, *markers: str) -> bool | None:
+    """Check markers in a module's source **without executing the module**.
 
-    Reads the file without importing the module.  Used by patches whose
-    applicability depends on an upstream code fingerprint rather than a
-    version number (design doc §7.2: when metadata cannot decide, the patch
-    checks the actual source/symbols).
+    Several MUSA-fork defects this package works around are identified by
+    exact code patterns whose presence depends on the vendor build, and the
+    vendor version strings do not follow the upstream API timeline.  Reading
+    source markers provide a conservative build fingerprint, not proof of
+    kernel correctness. The probe never runs the module body.
+
+    Dotted names are resolved from the top-level package's spec by joining
+    the remaining parts as file paths -- resolving a submodule through the
+    import system would import (and execute) its parents.
+
+    Returns ``True`` when every marker appears in the source, ``False`` when
+    the source is readable and any marker is missing, and ``None`` when the
+    probe cannot decide (unsupported layout or unreadable source).
+    A missing package or submodule returns False.
+    Callers choose their own policy for the unknown case.
     """
-    spec = importlib.util.find_spec(module_name)
-    if spec is None or not spec.origin:
-        return None
+    if not markers:
+        raise ValueError("module_source_contains requires at least one marker")
+    parts = module_name.split(".")
     try:
-        with open(spec.origin, "rb") as handle:
-            return needle.encode() in handle.read()
+        spec = find_spec_without_watchers(parts[0])
+    except Exception:  # noqa: BLE001 - a broken lookup is an undecided probe
+        return None
+    if spec is None:
+        return False  # the top-level package is genuinely absent
+    origin = getattr(spec, "origin", None)
+    if not origin or not origin.endswith(".py"):
+        return None  # namespace/zip layout: undecidable without executing
+    from pathlib import Path
+
+    if len(parts) == 1:
+        target = Path(origin)
+    elif not getattr(spec, "submodule_search_locations", None):
+        return False
+    else:
+        target = Path(origin).parent.joinpath(*parts[1:])
+    if target.is_dir():
+        target = target / "__init__.py"
+    elif not target.exists():
+        target = (
+            target.with_name(target.name + ".py") if not target.name.endswith(".py") else target
+        )
+    if not target.exists():
+        return False  # submodule file genuinely absent
+    try:
+        with open(target, encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
     except OSError:
         return None
+    return all(marker in source for marker in markers)
 
 
 # ---------------------------------------------------------------------------
