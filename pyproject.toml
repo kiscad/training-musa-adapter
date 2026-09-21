@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# training-musa-adaptor versions independently of any upstream framework
+# (design doc §1.2); upstream version ranges live in each patch's
+# version_gates and in the validation matrix.
+name = "training-musa-adaptor"
+version = "0.1.0.dev0"
+description = "Minimal, reversible runtime patches that let upstream training frameworks (Megatron-Core, transformers, ms-swift, ...) run on Moore Threads MUSA GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "training-musa-adaptor maintainers" }]
+keywords = ["musa", "torch_musa", "moore-threads", "megatron", "transformers", "runtime-patch"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Lazy-loaded at the first relevant import boundary, never on the bootstrap
+# path (design doc §7.1/§7.2).  torch / torch_musa / torchada / TE / mate /
+# flash_attn come from the host environment and are intentionally NOT
+# declared here: installing the adaptor must not upgrade the vendor stack.
+dependencies = [
+    "packaging>=23.0",
+    "tomli; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+# PyTorch's out-of-tree device-backend autoload hook: fires at the very end
+# of ``import torch``, before any framework module can run.  Kill switches:
+#   TORCH_DEVICE_BACKEND_AUTOLOAD=0    (torch's own channel switch)
+#   TRAINING_MUSA_ADAPTOR_AUTOLOAD=0   (ours; explicit API stays usable)
+[project.entry-points."torch.backends"]
+training_musa_adaptor = "training_musa_adaptor.activation:torch_backend_autoload"
+
+[project.scripts]
+training-musa-adaptor = "training_musa_adaptor.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+training_musa_adaptor = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "musa: needs a live MUSA stack (torch_musa + device); skipped otherwise",
+    "integration: needs TRAINING_MUSA_ADAPTOR_RUN_INTEGRATION=1",
+]

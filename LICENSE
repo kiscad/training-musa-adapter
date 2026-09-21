@@ -1,0 +1,12 @@
+License selection is pending for musa-adapter.
+
+This project is a refactor of megatron-musa-patch into a general MUSA
+runtime adaptation framework.  Until the maintainers select the final
+license, treat the repository as:
+
+  * Original framework code (engine, config, operators, diagnostics):
+    not yet licensed for redistribution.
+  * Code and measured capability windows ported from megatron-musa-patch:
+    governed by that project's license (see NOTICE).
+
+Do not redistribute this repository until the license is finalized.
