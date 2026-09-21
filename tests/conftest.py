@@ -130,14 +130,19 @@ def fake_package(tmp_path, monkeypatch):
 
 @pytest.fixture
 def stub_module(monkeypatch):
-    """Install a synthetic module in ``sys.modules`` (cleaned up at teardown)."""
+    """Install a synthetic module in ``sys.modules``.
+
+    ``monkeypatch.setitem`` restores the previous entry (real module or
+    absence) at teardown -- never pop these manually: popping a real module
+    (e.g. torch) and re-importing it re-executes an already-loaded C
+    extension, which aborts the interpreter.
+    """
 
     def make(name: str, **attributes) -> types.ModuleType:
         module = types.ModuleType(name)
         for key, value in attributes.items():
             setattr(module, key, value)
         monkeypatch.setitem(sys.modules, name, module)
-        _SYNTHETIC_MODULES.add(name)
         return module
 
     return make
