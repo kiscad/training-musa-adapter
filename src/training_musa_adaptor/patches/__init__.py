@@ -18,7 +18,7 @@ from __future__ import annotations
 __all__ = ["PATCHES", "MODULES"]
 
 from . import platform
-from .megatron import attention
+from .megatron import attention, layer_norm
 from .transformers import rms_norm
 
 # Populated as domains migrate (docs/MIGRATION_LEDGER.md tracks status):
@@ -26,6 +26,7 @@ from .transformers import rms_norm
 MODULES = (
     platform,
     attention,
+    layer_norm,
     rms_norm,
 )
 

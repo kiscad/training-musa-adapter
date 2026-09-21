@@ -33,7 +33,8 @@ def _isolate_env(monkeypatch):
     removes any switch the test itself set.
     """
     for name in list(os.environ):
-        if name.startswith(_ENV_PREFIXES):
+        # RUN_INTEGRATION is a test-suite switch, not adaptor configuration.
+        if name.startswith(_ENV_PREFIXES) and name != "TMA_RUN_INTEGRATION":
             monkeypatch.delenv(name, raising=False)
 
 
@@ -140,3 +141,20 @@ def stub_module(monkeypatch):
         return module
 
     return make
+
+
+def integration_env(extra: dict | None = None) -> dict:
+    """Environment for subprocess integration tests: adaptor on, importable."""
+    from pathlib import Path
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")}
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
+    paths = [str(Path(__file__).resolve().parents[1] / "src")]
+    if env.get("MEGATRON_LM_PATH"):
+        paths.append(env["MEGATRON_LM_PATH"])
+    if os.environ.get("PYTHONPATH"):
+        paths.append(os.environ["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    if extra:
+        env.update(extra)
+    return env

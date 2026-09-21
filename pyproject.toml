@@ -57,5 +57,5 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
     "musa: needs a live MUSA stack (torch_musa + device); skipped otherwise",
-    "integration: needs TRAINING_MUSA_ADAPTOR_RUN_INTEGRATION=1",
+    "integration: needs TMA_RUN_INTEGRATION=1",
 ]
