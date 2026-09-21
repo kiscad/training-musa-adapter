@@ -17,8 +17,8 @@ from __future__ import annotations
 
 __all__ = ["PATCHES", "MODULES"]
 
-from . import platform, transformer_engine
-from .megatron import attention, grouped_gemm, layer_norm, moe, softmax
+from . import mcore_bridge, platform, transformer_engine
+from .megatron import attention, grouped_gemm, layer_norm, moe, rope, softmax, ssm
 from .transformers import rms_norm
 
 # Populated as domains migrate (docs/MIGRATION_LEDGER.md tracks status):
@@ -30,7 +30,10 @@ MODULES = (
     layer_norm,
     moe,
     grouped_gemm,
+    rope,
     softmax,
+    ssm,
+    mcore_bridge,
     rms_norm,
 )
 
