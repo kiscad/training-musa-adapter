@@ -359,6 +359,8 @@ def test_gdn_hardware_smoke():
     import sys
     from pathlib import Path
 
+    import pytest
+
     if os.environ.get("TMA_RUN_INTEGRATION") != "1":
         pytest.skip("set TMA_RUN_INTEGRATION=1 with a working Megatron/MUSA stack")
     from tests.conftest import integration_env
