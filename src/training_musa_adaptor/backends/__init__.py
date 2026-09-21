@@ -7,7 +7,9 @@ the engine; ``musa_available`` never imports torchada just to probe.
 
 from __future__ import annotations
 
-__all__ = ["musa_available"]
+from . import torch_cuda
+
+__all__ = ["torch_cuda", "musa_available"]
 
 
 def musa_available() -> bool:

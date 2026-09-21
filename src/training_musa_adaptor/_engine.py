@@ -533,8 +533,15 @@ class Engine:
         apply (caveated); hooks whose boundary is gone are phase_missed.
         Idempotent -- safe to re-run after late registration."""
         for module_name in list(self._hooks):
-            if sys.modules.get(module_name) is not None:
+            module = sys.modules.get(module_name)
+            initializing = bool(
+                module is not None
+                and getattr(getattr(module, "__spec__", None), "_initializing", False)
+            )
+            if module is not None and not initializing:
                 # The import boundary is gone; never re-run a hook late.
+                # A module currently executing (present in sys.modules but
+                # _initializing) is NOT missed: its boundary is live right now.
                 for patch in self._hooks.pop(module_name):
                     record = self._records[patch.id]
                     if record.status == "pending":

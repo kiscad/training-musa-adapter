@@ -172,7 +172,12 @@ def _eligible(self, query, key, value, packed, num_splits, mask_name, attention_
             return False
     if mask_name not in _ALLOWED_MASKS:
         return False
-    if attention_mask is None and ("padding" in mask_name or mask_name == "arbitrary"):
+    if packed is None and attention_mask is None and (
+        "padding" in mask_name or mask_name == "arbitrary"
+    ):
+        # Dense calls cannot express a padding/arbitrary mask without the
+        # tensor; packed THD spans carry only valid tokens, so the padding
+        # qualifier is dropped per span instead (old-code guard restored).
         return False
     if getattr(self, "window_size", None) == (-1, 0) and "causal" not in mask_name:
         return False
