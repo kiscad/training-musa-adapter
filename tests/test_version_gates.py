@@ -137,34 +137,41 @@ def test_source_probe_handles_top_level_module(tmp_path, monkeypatch):
     source = tmp_path / "probe.py"
     source.write_text("MARKER = True\n")
 
-    def fake_find_spec(name):
+    def fake_find_spec(name, path=None, target=None):
         if name != "probe":
             return None
-        return SimpleNamespace(origin=str(source))
+        return SimpleNamespace(origin=str(source), submodule_search_locations=None)
 
-    monkeypatch.setattr(_compat.importlib.util, "find_spec", fake_find_spec)
+    # the probe resolves via find_spec_without_watchers (never executes code)
+    import training_musa_adaptor._imports as _imports
+
+    monkeypatch.setattr(_imports, "find_spec_without_watchers", fake_find_spec)
+    monkeypatch.setattr(_compat, "find_spec_without_watchers", fake_find_spec)
     assert _compat.module_source_contains("probe", "MARKER") is True
     assert _compat.module_source_contains("probe", "ABSENT") is False
-    # v2.0 contract: True/False/None -- an unresolvable module is "unknown".
-    assert _compat.module_source_contains("probe.child", "MARKER") is None
+    # v2.0 contract: True/False/None -- a flat module has no submodule path,
+    # so a child probe is a straightforward "absent" (False), not "unknown".
+    assert _compat.module_source_contains("probe.child", "MARKER") is False
 
 
 def test_source_probe_never_executes_the_target_module(tmp_path, monkeypatch, tracked_modules):
-    """Ported from test_source_probe_does_not_import_parents.  v2.0 delegates
-    to importlib.util.find_spec, which *does* import the parent package of a
-    dotted name (documented platform behavior, see _imports.py); the probe's
-    own guarantee is that the target module's body never executes."""
+    """Ported from test_source_probe_does_not_import_parents.  The probe
+    resolves dotted names by joining file paths off the top-level package's
+    spec (ported verbatim from the old engine): neither the parents nor the
+    target module's body ever executes."""
     package = tmp_path / "gate_source_probe"
     package.mkdir()
-    (package / "__init__.py").write_text("")
-    (package / "child.py").write_text("MARKER = 1\nraise RuntimeError('must not execute')\n")
+    (package / "__init__.py").write_text("raise RuntimeError('parent must not execute')\n")
+    (package / "child.py").write_text("MARKER = 1\nraise RuntimeError('child must not execute')\n")
     monkeypatch.syspath_prepend(str(tmp_path))
     tracked_modules.add("gate_source_probe")
 
     assert _compat.module_source_contains("gate_source_probe.child", "MARKER") is True
+    assert "gate_source_probe" not in sys.modules
     assert "gate_source_probe.child" not in sys.modules
     assert _compat.module_source_contains("gate_source_probe.child", "ABSENT") is False
-    assert _compat.module_source_contains("gate_source_probe.missing", "MARKER") is None
+    # a genuinely absent submodule file is False, not "unknown" (None)
+    assert _compat.module_source_contains("gate_source_probe.missing", "MARKER") is False
 
 
 def test_missing_metadata_keeps_target_policy(monkeypatch):
