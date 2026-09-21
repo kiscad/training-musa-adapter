@@ -215,7 +215,6 @@ class Engine:
         self._watcher = ImportWatcher(self)
         self._installed = False
         self._config_ready = False
-        self._applied_sweep_done = False
         self._restart_required: list[str] = []
         #: initialization failure saved by the automatic channel; raised at
         #: the first relevant boundary (design doc §5.5)
@@ -388,6 +387,11 @@ class Engine:
             if eager:
                 self._ensure_config()
             return
+        for record in self._records.values():
+            if record.status == "reverted":
+                # A fresh install after a clean uninstall may re-apply.
+                record.status, record.detail = "pending", "reinstall"
+
         if self._bindings or any(
             isinstance(item, HookPatch) and self._records[item.id].status == "failed"
             for item in self._undo_order
@@ -525,9 +529,9 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _apply_already_imported(self) -> None:
-        if self._applied_sweep_done:
-            return
-        self._applied_sweep_done = True
+        """Late application for fully imported modules: attr patches may
+        apply (caveated); hooks whose boundary is gone are phase_missed.
+        Idempotent -- safe to re-run after late registration."""
         for module_name in list(self._hooks):
             if sys.modules.get(module_name) is not None:
                 # The import boundary is gone; never re-run a hook late.
@@ -784,7 +788,6 @@ class Engine:
             sys.meta_path.remove(self._watcher)
         self._installed = False
         self._config_ready = False
-        self._applied_sweep_done = False
         self._attrs.clear()
         self._hooks.clear()
         errors = []
