@@ -1,6 +1,6 @@
 """Attention implementation selection: plain functions, fixed candidates.
 
-Design doc §6.  The framework patch parses the upstream contract
+The framework patch parses the upstream contract
 (signature, masks, layouts, return shape) and captures the original handle;
 this module only checks input metadata against the *measured* capability
 windows and calls the chosen implementation.  No Binding/Provider
@@ -16,15 +16,17 @@ Candidate implementations (operator-local names, not global IDs):
 - ``torch_sdpa_math`` declared slot: math-path forcing unverified (closed)
 
 Measured windows (muDNN v3107 / MT-TE 2.0.0 / torch_musa 2.7.1 / mate 0.2.6)
-are documented in docs/MIGRATION_LEDGER.md; they are stack-specific
+are documented in docs/PATCH_LEDGER.md; they are stack-specific
 evidence, not a universal MUSA ranking.
 """
 
 from __future__ import annotations
 
-import functools
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any
+
+from .._config import ATTENTION_IMPLEMENTATIONS
 
 __all__ = [
     "DECLARED_IMPLEMENTATIONS",
@@ -38,17 +40,27 @@ __all__ = [
 ]
 
 #: All implementation names this call site knows about (config validation).
-DECLARED_IMPLEMENTATIONS = (
-    "mudnn",
-    "mate",
-    "flash_attn",
-    "te_unfused",
-    "torch_sdpa_math",
-)
+DECLARED_IMPLEMENTATIONS = tuple(sorted(ATTENTION_IMPLEMENTATIONS))
 
 #: Fixed candidate order for the verified stack; reference implementations
 #: join through fallback=reference, not through the default order.
 DEFAULT_CANDIDATE_ORDER = ("mudnn", "mate")
+
+# One bounded snapshot per call site; no tensors or unbounded event history.
+_LAST_DISPATCH: dict[str, dict[str, Any]] = {}
+
+
+def dispatch_report() -> dict[str, dict[str, Any]]:
+    return {site: dict(record) for site, record in _LAST_DISPATCH.items()}
+
+
+def _note_dispatch(call_site: str, implementation: str, entry: Any, reasons) -> None:
+    _LAST_DISPATCH[call_site] = {
+        "implementation": implementation,
+        "entry": f"{getattr(entry, '__module__', '')}:{getattr(entry, '__qualname__', type(entry).__name__)}",
+        "rejections": tuple(reasons),
+    }
+
 
 #: MuDNN flash window (torch_musa 2.7.1 / MT-TE 2.0.0, muDNN v3107).
 _MIN_FLASH_DIM = 64
@@ -64,12 +76,17 @@ _FLOAT_DTYPES = ("torch.float16", "torch.bfloat16", "torch.float32", "torch.floa
 
 
 class NoCompatibleImplementation(RuntimeError):
-    """No candidate satisfied the policy for this call (design doc §6.3)."""
+    """No candidate satisfied the policy for this call."""
 
-    def __init__(self, call_site: str, meta_summary: str, reasons: Sequence[tuple[str, str]]):
+    def __init__(
+        self, call_site: str, meta_summary: str, reasons: Sequence[tuple[str, str]]
+    ):
         self.call_site = call_site
         self.reasons = tuple(reasons)
-        detail = "; ".join(f"{who}: {reason}" for who, reason in self.reasons) or "no candidates"
+        detail = (
+            "; ".join(f"{who}: {reason}" for who, reason in self.reasons)
+            or "no candidates"
+        )
         super().__init__(
             f"no compatible attention implementation for {call_site} "
             f"({meta_summary}); rejections: {detail}"
@@ -101,12 +118,14 @@ class AttentionMeta:
     mask_kind: str  # no_mask|causal|padding|padding_causal|causal_bottom_right|padding_causal_bottom_right|arbitrary
     has_attention_mask: bool
     has_attention_bias: bool
-    sliding_window: tuple[int, int] | None  # None = unrestricted (TE's (-1,0)/(-1,-1) normalized by the patch)
+    sliding_window: (
+        tuple[int, int] | None
+    )  # None = unrestricted (TE's (-1,0)/(-1,-1) normalized by the patch)
     softmax_scale: float | None
     has_alibi: bool
     training: bool
     dropout_p: float
-    may_require_backward: bool  # checkpoint recompute counts (design §6.4)
+    may_require_backward: bool  # checkpoint recompute counts
     deterministic: bool
     cp_size: int
     fp8: bool
@@ -127,7 +146,7 @@ class Implementation:
     """One candidate: name, role, metadata check, lazy loader, runner.
 
     ``supports`` reads metadata only: no kernel launches, no collectives,
-    no RNG consumption, no tensor sync (design doc §6.3).
+    no RNG consumption, no tensor sync.
     """
 
     name: str
@@ -137,22 +156,14 @@ class Implementation:
     run_fn: Callable[[Any, Any], Any]
     _loaded: Any = field(default=None, repr=False)
     _load_error: str | None = field(default=None, repr=False)
-    _traceback: str = field(default="", repr=False)
 
     def ensure_loaded(self) -> tuple[Any, str | None]:
         """Safe-init load (once): (payload, rejection_reason)."""
         if self._loaded is not None or self._load_error is not None:
             return self._loaded, self._load_error
-        try:
-            self._loaded, self._load_error = self.load_fn()
-        except Exception as exc:  # noqa: BLE001 - init failures are not "missing"
-            import traceback
-
-            self._load_error = (
-                f"initialization failed ({type(exc).__name__}: {exc}); "
-                "not treated as package-missing"
-            )
-            self._traceback = traceback.format_exc()
+        # Only loaders may classify a known absence. Unexpected import/ABI
+        # failures propagate; they must never silently select another kernel.
+        self._loaded, self._load_error = self.load_fn()
         return self._loaded, self._load_error
 
     def supports(self, meta: AttentionMeta) -> tuple[bool, str]:
@@ -246,7 +257,10 @@ def _te_unfused_supports(meta: AttentionMeta) -> tuple[bool, str]:
         return False, "context parallel stays upstream"
     if meta.fp8 or meta.has_alibi or meta.extra_outputs:
         return False, "fp8/alibi/extra outputs"
-    if meta.mask_kind in ("padding", "padding_causal", "arbitrary") and not meta.has_attention_mask:
+    if (
+        meta.mask_kind in ("padding", "padding_causal", "arbitrary")
+        and not meta.has_attention_mask
+    ):
         return False, f"{meta.mask_kind} mask requires an attention_mask tensor"
     return True, ""
 
@@ -264,11 +278,12 @@ def _closed_slot(reason: str) -> Callable[[AttentionMeta], tuple[bool, str]]:
 
 
 def _load_mate() -> tuple[Any, str | None]:
-    """mate.flash_attn_varlen_func lazily; a missing/broken install is a
-    known, isolated skip -- not an initialization crash."""
+    """Load mate lazily; only an absent top-level package is an optional miss."""
     try:
         import mate
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if exc.name != "mate":
+            raise
         return None, "mate package not installed"
     fn = getattr(mate, "flash_attn_varlen_func", None)
     if fn is None:
@@ -343,7 +358,11 @@ def _te_padding_mask(attention_mask, sq, sk, attention_type="self"):
         if len(shaped_masks) != 2:
             return None
         q_mask, k_mask = shaped_masks
-        if q_mask.shape[-1] != sq or k_mask.shape[-1] != sk or q_mask.shape[0] != k_mask.shape[0]:
+        if (
+            q_mask.shape[-1] != sq
+            or k_mask.shape[-1] != sk
+            or q_mask.shape[0] != k_mask.shape[0]
+        ):
             return None
         return q_mask, k_mask
     if attention_type != "self" or sq != sk:
@@ -401,6 +420,16 @@ def _run_te_unfused(_payload, call) -> Any:
     )
 
 
+def _closed_slot_run(message: str) -> Callable[[Any, Any], Any]:
+    """A named raiser for closed slots; the function name appears in
+    tracebacks instead of ``<lambda>``."""
+
+    def run(_payload, _call) -> Any:
+        raise RuntimeError(message)
+
+    return run
+
+
 IMPLEMENTATIONS: dict[str, Implementation] = {
     "mudnn": Implementation(
         name="mudnn",
@@ -432,9 +461,7 @@ IMPLEMENTATIONS: dict[str, Implementation] = {
             "processes; slot closed"
         ),
         load_fn=lambda: (None, "slot closed (measured backward instability)"),
-        run_fn=lambda payload, call: (_ for _ in ()).throw(
-            RuntimeError("flash_attn slot is closed on this stack")
-        ),
+        run_fn=_closed_slot_run("flash_attn slot is closed on this stack"),
     ),
     "torch_sdpa_math": Implementation(
         name="torch_sdpa_math",
@@ -444,15 +471,13 @@ IMPLEMENTATIONS: dict[str, Implementation] = {
             "interface that re-dispatches internally is not a reference"
         ),
         load_fn=lambda: (None, "slot closed (unverified math path)"),
-        run_fn=lambda payload, call: (_ for _ in ()).throw(
-            RuntimeError("torch_sdpa_math slot is not verified on this stack")
-        ),
+        run_fn=_closed_slot_run("torch_sdpa_math slot is not verified on this stack"),
     ),
 }
 
 
 # ---------------------------------------------------------------------------
-# Candidate resolution & selection (design doc §6.2/§6.3)
+# Candidate resolution & selection
 # ---------------------------------------------------------------------------
 
 
@@ -483,21 +508,29 @@ def resolve_candidates(
     if policy == "force":
         (name,) = implementations
         if name not in IMPLEMENTATIONS:
-            raise NoCompatibleImplementation("?", "", [(name, "unknown implementation")])
-        return [_Candidate("implementation", name, IMPLEMENTATIONS[name].role)], pre_rejections
+            raise NoCompatibleImplementation(
+                "?", "", [(name, "unknown implementation")]
+            )
+        return [
+            _Candidate("implementation", name, IMPLEMENTATIONS[name].role)
+        ], pre_rejections
 
     candidates: list[_Candidate] = []
     if policy == "prefer":
         for name in implementations:
             if name in IMPLEMENTATIONS:
-                candidates.append(_Candidate("implementation", name, IMPLEMENTATIONS[name].role))
+                candidates.append(
+                    _Candidate("implementation", name, IMPLEMENTATIONS[name].role)
+                )
             else:
                 pre_rejections.append((name, "unknown implementation"))
         for name in DEFAULT_CANDIDATE_ORDER:
             if all(candidate.name != name for candidate in candidates):
                 candidates.append(_Candidate("implementation", name))
     else:  # auto
-        candidates = [_Candidate("implementation", name) for name in DEFAULT_CANDIDATE_ORDER]
+        candidates = [
+            _Candidate("implementation", name) for name in DEFAULT_CANDIDATE_ORDER
+        ]
 
     if fallback == "reference":
         for name in reference_impls:
@@ -521,24 +554,34 @@ def select_and_run(
     """Run the first candidate whose measured window covers this call.
 
     Once an implementation starts running, its exceptions propagate -- the
-    candidate loop is never re-entered (design doc §6.3).
+    candidate loop is never re-entered.
     """
     reasons: list[tuple[str, str]] = list(pre_rejections)
     for candidate in candidates:
         if candidate.kind == "original":
             supported, reason = original_supports(call)
             if supported:
-                return call_original(call)
+                result = call_original(call)
+                _note_dispatch(
+                    call_site,
+                    "upstream",
+                    getattr(call, "original", call_original),
+                    reasons,
+                )
+                return result
             reasons.append(("original", reason))
             continue
         implementation = IMPLEMENTATIONS[candidate.name]
-        payload, load_error = implementation.ensure_loaded()
-        if payload is None:
-            reasons.append((candidate.name, load_error or "not loadable"))
-            continue
         supported, reason = implementation.supports(meta)
         if not supported:
             reasons.append((candidate.name, reason))
             continue
-        return implementation.run_fn(payload, call)
+        payload, load_error = implementation.ensure_loaded()
+        if payload is None:
+            reasons.append((candidate.name, load_error or "not loadable"))
+            continue
+        result = implementation.run_fn(payload, call)
+        entry = payload if callable(payload) else implementation.run_fn
+        _note_dispatch(call_site, candidate.name, entry, reasons)
+        return result
     raise NoCompatibleImplementation(call_site, meta.summary(), reasons)

@@ -1,13 +1,11 @@
 """Gated delta rule dispatcher: TileLang where supported, FLA everywhere else.
 
-Shared by two real call sites (design doc §6.1: only genuinely duplicated
-logic lives in ops/):
+Shared by two framework call sites:
 
 - ``patches/megatron/ssm.py``     -- Megatron Core's FLA binding
-- ``patches/mcore_bridge.py``     -- mcore-bridge's own re-imported binding
+- ``patches/mcore_bridge/ssm.py`` -- mcore-bridge's own re-imported binding
 
-Ported from megatron-musa-patch ``patches/_ssm.py`` (rev a1090de).  The
-TileLang stack is version-bound (tilelang-musa + torch-kernels must match
+The TileLang stack is version-bound (tilelang-musa + torch-kernels must match
 the torch_musa/musa_toolkits release) and its kernels JIT-compile on first
 use per head count and specialization (minutes, cached in ~/.tilelang;
 pre-warm once -- concurrent multi-rank compiles into the shared cache have
@@ -18,7 +16,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Any, Callable, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 __all__ = ["make_tilelang_dispatcher", "MARKER"]
 
@@ -44,7 +43,13 @@ _POSITIONAL = ("q", "k", "v", "g", "beta")
 #: such as ``use_beta_sigmoid_in_kernel``, CP contexts, ...) stays with FLA.
 _KNOWN_KWARGS = frozenset(
     _POSITIONAL
-    + ("scale", "initial_state", "output_final_state", "use_qk_l2norm_in_kernel", "cu_seqlens")
+    + (
+        "scale",
+        "initial_state",
+        "output_final_state",
+        "use_qk_l2norm_in_kernel",
+        "cu_seqlens",
+    )
 )
 
 
@@ -54,16 +59,16 @@ def _warn_once(key: str, message: str, *args: Any) -> None:
         logger.warning(message, *args)
 
 
-def _tilelang_stack() -> Optional[
-    Tuple[Callable[..., Any], Callable[..., bool], Callable[..., bool]]
-]:
+def _tilelang_stack() -> (
+    tuple[Callable[..., Any], Callable[..., bool], Callable[..., bool]] | None
+):
     """torch-kernels' GDN front door plus its own shape guards, or ``None``.
 
     Called from ``replace`` while the target module is being patched, i.e. in
     a process that already runs a real MUSA torch.  Importing torch-kernels
     here (and the TileLang backend it resolves lazily) keeps the patch
-    modules importable on machines without the stack; a broken install
-    declines instead of crashing the first training step.
+    modules importable on machines without the stack. A missing package
+    declines; errors inside an installed backend remain visible.
     """
     try:
         from torch_kernels.attention import gated_delta_net as front_door
@@ -72,7 +77,9 @@ def _tilelang_stack() -> Optional[
             gdn_dense_supported,
             gdn_varlen_supported,
         )
-    except Exception as exc:  # ImportError, or a broken native extension
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch_kernels":
+            raise
         _warn_once(
             "torch-kernels-missing",
             "training-musa-adaptor: torch-kernels is unavailable (%s: %s); the "
@@ -91,7 +98,9 @@ def _tilelang_stack() -> Optional[
     return front_door, gdn_dense_supported, gdn_varlen_supported
 
 
-def _normalized_call(args: Tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _normalized_call(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any] | None:
     """fla-shaped arguments as a plain dict, or ``None`` when not translatable.
 
     The wrapper must stay signature-transparent for FLA: unknown keywords,
@@ -100,7 +109,7 @@ def _normalized_call(args: Tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[
     """
     if len(args) > len(_POSITIONAL):
         return None
-    call = dict(zip(_POSITIONAL, args))
+    call = dict(zip(_POSITIONAL, args, strict=False))  # fewer positionals is legitimate
     for key, value in kwargs.items():
         if key not in _KNOWN_KWARGS or key in call:
             return None
@@ -111,7 +120,9 @@ def _normalized_call(args: Tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[
 
 
 def _supported_by_tilelang(
-    call: dict[str, Any], dense_supported: Callable[..., bool], varlen_supported: Callable[..., bool]
+    call: dict[str, Any],
+    dense_supported: Callable[..., bool],
+    varlen_supported: Callable[..., bool],
 ) -> bool:
     """Whether this exact call is inside the TileLang kernels' audited envelope.
 
@@ -136,17 +147,30 @@ def _supported_by_tilelang(
         return False
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or g.ndim != 3 or beta.ndim != 3:
         return False
-    if len({t.shape[2] for t in (v, g, beta)}) != 1:  # value heads must agree
+    # The kernel shape predicates describe one normalized shape. They do
+    # not validate agreement between inputs or the GVA head expansion.
+    if q.shape != k.shape or any(t.shape[:2] != q.shape[:2] for t in (v, g, beta)):
+        return False
+    query_heads, heads = q.shape[2], v.shape[2]
+    if query_heads < 1 or heads < 1 or heads % query_heads:
+        return False
+    if g.shape != beta.shape or g.shape[2] != heads:
         return False
 
     scale = call.get("scale")
     if scale is not None:
-        if isinstance(scale, torch.Tensor) or not isinstance(scale, (int, float)) or not scale > 0:
+        if (
+            isinstance(scale, torch.Tensor)
+            or not isinstance(scale, (int, float))
+            or not scale > 0
+        ):
             return False
 
     initial_state = call.get("initial_state")
     if initial_state is not None and (
-        not torch.is_tensor(initial_state) or initial_state.device != device
+        not torch.is_tensor(initial_state)
+        or initial_state.device != device
+        or initial_state.shape != (q.shape[0], heads, k.shape[3], v.shape[3])
     ):
         return False
 
@@ -160,9 +184,23 @@ def _supported_by_tilelang(
         if heads > 8 and heads % 8:
             return False
         return dense_supported(batch, seq, heads, key_dim, value_dim)
-    if not torch.is_tensor(cu_seqlens) or cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+    if (
+        not torch.is_tensor(cu_seqlens)
+        or cu_seqlens.ndim != 1
+        or cu_seqlens.shape[0] < 2
+        or cu_seqlens.dtype not in (torch.int32, torch.int64)
+        or q.shape[0] != 1
+    ):
         return False
-    lengths = [int(n) for n in torch.diff(cu_seqlens.detach()).cpu().tolist()]
+    # The host read is already required by the per-sequence shape guard.
+    # Inspect endpoints too, and compute differences here instead of
+    # launching a device kernel and silently truncating floating offsets.
+    offsets = cu_seqlens.detach().cpu().tolist()
+    if offsets[0] != 0 or offsets[-1] != q.shape[1]:
+        return False
+    lengths = [end - start for start, end in zip(offsets, offsets[1:], strict=False)]
+    if any(length < 0 for length in lengths):
+        return False
     return varlen_supported(lengths, heads, key_dim, value_dim)
 
 
@@ -186,7 +224,9 @@ def make_tilelang_dispatcher(original: Any) -> Any:
     def chunk_gated_delta_rule(*args: Any, **kwargs: Any):
         global _dispatch_noted
         call = _normalized_call(args, kwargs)
-        if call is None or not _supported_by_tilelang(call, dense_supported, varlen_supported):
+        if call is None or not _supported_by_tilelang(
+            call, dense_supported, varlen_supported
+        ):
             return original(*args, **kwargs)
         if not _dispatch_noted:
             _dispatch_noted = True
