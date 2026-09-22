@@ -8,7 +8,7 @@ Quick start: install the package and do nothing else::
 The ``torch.backends`` entry point makes PyTorch call
 :func:`training_musa_adaptor.activation.torch_backend_autoload` at the end
 of ``import torch``.  ``import training_musa_adaptor`` itself is
-**lightweight and never patches anything** (design doc §7.3); the explicit
+**lightweight and never patches anything**; the explicit
 API is for diagnostics, custom integration and tests::
 
     import training_musa_adaptor as tma

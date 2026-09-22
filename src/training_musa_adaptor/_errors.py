@@ -48,16 +48,17 @@ class ConfigError(TrainingMusaAdaptorError):
     """Invalid configuration: unknown field/ID/implementation/enum/type.
 
     Config errors are hard failures at the first relevant import boundary;
-    nothing silently falls back to defaults (design doc §7.1).
+    nothing silently falls back to defaults.
     """
 
 
 class EngineOverlapError(TrainingMusaAdaptorError):
     """A known legacy patch engine is active in this process.
 
-    megatron-musa-patch and the first-round musa-adapter engine must not be
-    active simultaneously with training-musa-adaptor (design doc §9.3):
-    two engines writing the same targets is not a supported scenario.
+    Known legacy adaptation engines must not be active simultaneously with
+    training-musa-adaptor: two engines writing the same
+    targets is not a supported scenario. The error message names the
+    detected engine so it can be removed.
     """
 
 

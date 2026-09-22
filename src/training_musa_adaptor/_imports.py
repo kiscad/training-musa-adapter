@@ -1,6 +1,6 @@
 """Import watcher: one coordinated MetaPathFinder/loader wrapper.
 
-Design doc §5.2 -- the targeted fixes over the old engine:
+Import-boundary contracts:
 
 - ``find_spec`` only *locates and wraps* the spec.  Hook callbacks run at
   the loader's real ``exec_module`` boundary, so an external existence
@@ -29,9 +29,10 @@ __all__ = ["ImportWatcher", "WATCHER_MARKER", "find_spec_without_watchers"]
 #: can skip them: a plain existence query must not run pending actions.
 WATCHER_MARKER = "__training_musa_adaptor_import_watcher__"
 
-#: Watcher markers of known legacy patch engines.  Delegating find_spec
+#: Exact markers of known external engines, not runtime dependencies.
+#: Delegating find_spec
 #: through each other would recurse; overlapping *writes* to the same
-#: target are separately rejected by the engine (design doc §9.3).
+#: target are separately rejected by the engine.
 _KNOWN_WATCHER_MARKERS = (
     WATCHER_MARKER,
     "__megatron_musa_patch_import_watcher__",
@@ -56,10 +57,10 @@ def find_spec_without_watchers(fullname: str, path=None, target=None):
 class _PatchedLoader(importlib.abc.Loader):
     """Wraps one loader; runs the engine's exec-boundary phases around it."""
 
-    def __init__(self, wrapped: Any, fullname: str, engine: "Any") -> None:
+    def __init__(self, wrapped: Any, fullname: str, engines: list[Any]) -> None:
         self._wrapped = wrapped
         self._fullname = fullname
-        self._engine = engine
+        self._engines = engines
 
     def create_module(self, spec):
         create = getattr(self._wrapped, "create_module", None)
@@ -67,14 +68,19 @@ class _PatchedLoader(importlib.abc.Loader):
 
     def exec_module(self, module):
         # before-exec hooks (HookPatch.run) at the real boundary.
-        self._engine._run_hooks(self._fullname)
+        for engine in self._engines:
+            if engine._installed:
+                engine._run_hooks(self._fullname)
         try:
             self._wrapped.exec_module(module)
         except Exception as exc:
-            self._engine._mark_import_failed(self._fullname, exc)
+            for engine in self._engines:
+                engine._mark_import_failed(self._fullname, exc)
             raise
         # after-exec attr patches for this module.
-        self._engine._apply_for_module(self._fullname, module, trigger="import")
+        for engine in self._engines:
+            if engine._installed:
+                engine._apply_for_module(self._fullname, module, trigger="import")
 
     def __getattr__(self, item: str) -> Any:
         return getattr(self._wrapped, item)
@@ -83,7 +89,7 @@ class _PatchedLoader(importlib.abc.Loader):
 class ImportWatcher(importlib.abc.MetaPathFinder):
     """One finder per engine; wraps loaders of watched trigger modules."""
 
-    def __init__(self, engine: "Any") -> None:
+    def __init__(self, engine: Any) -> None:
         self._engine = engine
         setattr(self, WATCHER_MARKER, True)
 
@@ -95,7 +101,7 @@ class ImportWatcher(importlib.abc.MetaPathFinder):
             self._engine._mark_absent(fullname)
             return None
         if spec.loader is None:
-            # Namespace package: no execution body to hook into (§5.2).
+            # Namespace package: no execution body to hook into.
             self._engine._mark_namespace(fullname)
             return spec
         loader = spec.loader
@@ -104,5 +110,12 @@ class ImportWatcher(importlib.abc.MetaPathFinder):
         if isinstance(loader, importlib.util.LazyLoader):
             inner = getattr(loader, "loader", None)
             loader = inner if inner is not None else loader
-        spec.loader = _PatchedLoader(loader, fullname, self._engine)
+        # Coordinate all matching engines in installation order; skipping
+        # sibling finders during lookup must not discard their callbacks.
+        engines = [
+            finder._engine
+            for finder in reversed(sys.meta_path)
+            if isinstance(finder, ImportWatcher) and finder._engine._watches(fullname)
+        ]
+        spec.loader = _PatchedLoader(loader, fullname, engines)
         return spec

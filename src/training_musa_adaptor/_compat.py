@@ -2,19 +2,18 @@
 
 Standard-library only at import time: this module runs inside ``import
 torch`` via the ``torch.backends`` entry point.  ``packaging`` is imported
-lazily at the first real patch boundary (design doc §7.2), never here.
+lazily at the first real patch boundary, never here.
 """
 
 from __future__ import annotations
 
 import importlib.metadata as md
-import importlib.util
 import logging
 import re
-import sys
+from functools import lru_cache
 from typing import Any
 
-from ._errors import PatchTargetMissing, TrainingMusaAdaptorError
+from ._errors import PatchTargetMissing
 from ._imports import find_spec_without_watchers  # noqa: F401  (re-export)
 
 __all__ = [
@@ -33,7 +32,7 @@ __all__ = [
 logger = logging.getLogger("training_musa_adaptor")
 
 #: Distribution names whose ``import`` name differs from the pip name and is
-#: recorded in reports (design doc §7.2).
+#: recorded in reports.
 _IMPORT_NAMES: dict[str, str] = {
     "torch-musa": "torch_musa",
     "transformer-engine": "transformer_engine",
@@ -84,7 +83,9 @@ def require_attr(module: Any, attribute: str, *, patch_id: str, target: str) -> 
         try:
             owner = getattr(owner, part)
         except AttributeError as exc:
-            raise PatchTargetMissing(patch_id, target, f"cannot resolve {attribute!r}") from exc
+            raise PatchTargetMissing(
+                patch_id, target, f"cannot resolve {attribute!r}"
+            ) from exc
     return owner
 
 
@@ -131,7 +132,9 @@ def module_source_contains(module_name: str, *markers: str) -> bool | None:
         target = target / "__init__.py"
     elif not target.exists():
         target = (
-            target.with_name(target.name + ".py") if not target.name.endswith(".py") else target
+            target.with_name(target.name + ".py")
+            if not target.name.endswith(".py")
+            else target
         )
     if not target.exists():
         return False  # submodule file genuinely absent
@@ -144,10 +147,12 @@ def module_source_contains(module_name: str, *markers: str) -> bool | None:
 
 
 # ---------------------------------------------------------------------------
-# Version gates (design doc §7.2)
+# Version gates
 # ---------------------------------------------------------------------------
 
-_GATE_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9_.\-]+?)\s*(?P<spec><=|>=|==|!=|<|>|~=).*$")
+_GATE_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9_.\-]+?)\s*(?P<spec><=|>=|==|!=|<|>|~=).*$"
+)
 
 
 def parse_version_gate(gate: str) -> tuple[str, str]:
@@ -159,20 +164,33 @@ def parse_version_gate(gate: str) -> tuple[str, str]:
         )
     return (
         normalize_distribution_name(match.group("name")),
-        gate[match.start("spec"):].strip(),
+        gate[match.start("spec") :].strip(),
     )
 
 
-def validate_version_gates(gates: tuple[str, ...]) -> None:
+def validate_version_gates(
+    gates: tuple[str, ...], *, syntax_only: bool = False
+) -> None:
+    """Keep declaration imports stdlib-only; validate full PEP 440 at activation."""
+    if not isinstance(gates, tuple) or any(not isinstance(gate, str) for gate in gates):
+        raise ValueError("version_gates must be a tuple of strings")
     for gate in gates:
         name, specifier = parse_version_gate(gate)
-        _specifier_set(name, specifier)  # eager syntax validation only
+        if syntax_only:
+            for clause in specifier.split(","):
+                if not re.fullmatch(
+                    r"\s*(?:~=|==|!=|<=|>=|<|>)\s*v?\d[^\s,]*\s*", clause
+                ):
+                    raise ValueError(f"invalid version gate: {gate!r}")
+        else:
+            _specifier_set(name, specifier)
 
 
+@lru_cache(maxsize=128)
 def _specifier_set(distribution: str, specifier: str):
     """Build a SpecifierSet with prereleases explicitly included.
 
-    Design doc §7.2: prerelease handling is explicit (``prereleases=True``)
+    prerelease handling is explicit (``prereleases=True``)
     and tested, not left to the parsing library's implicit default; a
     vendor's rc/dev build must be *inside* the declared range to pass.
     """
@@ -181,7 +199,9 @@ def _specifier_set(distribution: str, specifier: str):
     try:
         return SpecifierSet(specifier, prereleases=True)
     except InvalidSpecifier as exc:
-        raise ValueError(f"invalid specifier {specifier!r} for {distribution}: {exc}") from exc
+        raise ValueError(
+            f"invalid specifier {specifier!r} for {distribution}: {exc}"
+        ) from exc
 
 
 def check_version_gate(gate: str) -> tuple[bool, str]:

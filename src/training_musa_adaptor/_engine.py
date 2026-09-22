@@ -1,13 +1,13 @@
 """Small, lazy patch registry with per-target transactions and explicit undo.
 
-Ported from megatron-musa-patch's engine with the v2.0 design changes:
+Design principles:
 
 - no framework-specific checks (multi-framework by construction);
 - hooks run at the real ``exec_module`` boundary (see ``_imports.py``),
   never inside ``find_spec``;
 - ONLY/DISABLE comes from the frozen config (old-project priority rule);
 - rebind_prefixes defaults to empty -- alias repair is an explicit,
-  scoped migration choice;
+  scoped alias-repair choice;
 - installing while a known legacy engine is active is refused.
 
 Attribute factories compose in PATCHES order: A listed before B yields
@@ -25,8 +25,9 @@ import inspect
 import logging
 import sys
 import types
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Iterator, Union
+from typing import Any
 
 from . import _config as _config_mod
 from ._compat import (
@@ -39,7 +40,6 @@ from ._errors import (
     ConfigError,
     EngineOverlapError,
     PatchConflict,
-    PatchTargetMissing,
     TrainingMusaAdaptorError,
 )
 from ._imports import ImportWatcher
@@ -101,12 +101,17 @@ class AttrPatch:
         if not isinstance(self.rebind_prefixes, tuple) or any(
             not prefix or not isinstance(prefix, str) for prefix in self.rebind_prefixes
         ):
-            raise ValueError("rebind_prefixes must be a tuple of nonempty module prefixes")
+            raise ValueError(
+                "rebind_prefixes must be a tuple of nonempty module prefixes"
+            )
         if not isinstance(self.requires, tuple) or any(
-            not isinstance(item, str) or not item or item == self.id for item in self.requires
+            not isinstance(item, str) or not item or item == self.id
+            for item in self.requires
         ):
-            raise ValueError("requires must contain nonempty companion patch ids, not self")
-        validate_version_gates(self.version_gates)
+            raise ValueError(
+                "requires must contain nonempty companion patch ids, not self"
+            )
+        validate_version_gates(self.version_gates, syntax_only=True)
 
 
 @dataclass(frozen=True)
@@ -133,16 +138,18 @@ class HookPatch:
     version_gates: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.trigger or not all(part.isidentifier() for part in self.trigger.split(".")):
+        if not self.trigger or not all(
+            part.isidentifier() for part in self.trigger.split(".")
+        ):
             raise ValueError("HookPatch.trigger must name a module")
         if not callable(self.run):
             raise TypeError("HookPatch.run must be callable")
         if self.undo is not None and not callable(self.undo):
             raise TypeError("HookPatch.undo must be callable")
-        validate_version_gates(self.version_gates)
+        validate_version_gates(self.version_gates, syntax_only=True)
 
 
-Patch = Union[AttrPatch, HookPatch]
+Patch = AttrPatch | HookPatch
 
 
 @dataclass
@@ -158,7 +165,11 @@ class AppliedPatch:
         return {
             "id": patch.id,
             "kind": "attr" if isinstance(patch, AttrPatch) else "hook",
-            "target": patch.target if isinstance(patch, AttrPatch) else f"{patch.trigger} (hook)",
+            "target": (
+                patch.target
+                if isinstance(patch, AttrPatch)
+                else f"{patch.trigger} (hook)"
+            ),
             "version_gates": list(patch.version_gates),
             "status": self.status,
             "detail": self.detail,
@@ -187,13 +198,20 @@ class _Binding:
             else:
                 delattr(self.owner, self.leaf)
         else:
-            logger.warning("not restoring %s: another writer replaced the patch", self.leaf)
+            logger.warning(
+                "not restoring %s: another writer replaced the patch", self.leaf
+            )
         for module, name, original in reversed(self.aliases):
             if vars(module).get(name) is self.replacement:
                 setattr(module, name, original)
         # Also repair same-name consumers imported after initial application.
         _rebind_aliases(
-            self.owner, self.leaf, self.replacement, self.original, self.rebind_prefixes, targets
+            self.owner,
+            self.leaf,
+            self.replacement,
+            self.original,
+            self.rebind_prefixes,
+            targets,
         )
 
 
@@ -210,14 +228,16 @@ class Engine:
         self._attrs: dict[str, list[AttrPatch]] = {}
         self._hooks: dict[str, list[HookPatch]] = {}
         self._bindings: dict[tuple[str, str], _Binding] = {}
-        self._undo_order: list[Union[tuple[str, str], HookPatch]] = []
+        self._undo_order: list[tuple[str, str] | HookPatch] = []
         self._running_hooks: set[str] = set()
+        self._failed_mutations: list[tuple] = []
+        self._patch_suites: dict[str, str] = {}
         self._watcher = ImportWatcher(self)
         self._installed = False
         self._config_ready = False
         self._restart_required: list[str] = []
         #: initialization failure saved by the automatic channel; raised at
-        #: the first relevant boundary (design doc §5.5)
+        #: the first relevant boundary
         self._saved_error: Exception | None = None
         self.config = _config_mod.ConfigManager()
 
@@ -225,8 +245,18 @@ class Engine:
     # Registration
     # ------------------------------------------------------------------
 
-    def register(self, patches: Iterable[Patch]) -> None:
-        """Validate a whole batch, then register it (also works after install)."""
+    def register(
+        self,
+        patches: Iterable[Patch],
+        *,
+        patch_suites: Mapping[str, str] | None = None,
+    ) -> None:
+        """Validate a whole batch, then register it (also works after install).
+
+        ``patch_suites`` maps patch id -> suite name; ONLY/DISABLE entries
+        naming a suite expand to every id of that suite.  Merges across
+        registrations; patches without an entry are not suite-addressable.
+        """
         patches = tuple(patches)
         ids = set(self._records)
         for patch in patches:
@@ -240,6 +270,11 @@ class Engine:
         self._validate_dependencies(
             [record.patch for record in self._records.values()] + list(patches)
         )
+        if self._config_ready:
+            for patch in patches:
+                validate_version_gates(patch.version_gates)
+        if patch_suites:
+            self._patch_suites.update(patch_suites)
         for patch in patches:
             self._records[patch.id] = AppliedPatch(patch)
             if self._config_ready:
@@ -251,9 +286,8 @@ class Engine:
     def _validate_dependencies(patches: list[Patch]) -> None:
         """Validate target-level DAGs without importing dependency modules.
 
-        requires only names companions on other attributes of the same
-        module; cycles, same-target and cross-module requires are rejected
-        (design doc §5.3).
+        ``requires`` only names companions on other attributes of the same
+        module; cycles, same-target and cross-module requires are rejected.
         """
         records = {patch.id: patch for patch in patches}
         edges: dict[tuple[str, str], set[tuple[str, str]]] = {}
@@ -274,7 +308,9 @@ class Engine:
                         f"{patch.id}: requires {pid} must target another attribute "
                         "in the same module"
                     )
-                edges.setdefault(key, set()).add((dependency.module_name, dependency.attr_name))
+                edges.setdefault(key, set()).add(
+                    (dependency.module_name, dependency.attr_name)
+                )
         visited, visiting = set(), set()
 
         def visit(key):
@@ -295,23 +331,14 @@ class Engine:
     # Configuration & scheduling
     # ------------------------------------------------------------------
 
-    def _declared_option_fields(self) -> dict[str, frozenset[str]]:
-        """Patches may declare patch_options fields; V1: attention patch only."""
-        return {
-            "megatron.te.attention.capability-dispatch": frozenset(
-                {"policy", "implementations", "fallback"}
-            )
-        }
-
-    def _available_impls(self) -> dict[str, frozenset[str]]:
-        from .ops import attention as _attention_ops
-
-        return {"attention": frozenset(_attention_ops.DECLARED_IMPLEMENTATIONS)}
-
     def _ensure_config(self) -> None:
         """Parse + freeze configuration once, at the first relevant boundary."""
+        if self._failed_mutations:
+            raise PatchConflict(
+                "patch cleanup is incomplete; retry uninstall() before applying"
+            )
         if self._saved_error is not None:
-            saved, self._saved_error = self._saved_error, None
+            saved = self._saved_error
             raise TrainingMusaAdaptorError(
                 f"initialization failed earlier: {type(saved).__name__}: {saved}"
             ) from saved
@@ -319,14 +346,18 @@ class Engine:
             return
         config = self.config.freeze(
             registered_patch_ids=set(self._records),
-            patch_option_declarations=self._declared_option_fields(),
-            available_impls=self._available_impls(),
+            patch_suites=self._patch_suites or None,
         )
+        for record in self._records.values():
+            validate_version_gates(record.patch.version_gates)
         if not config.enabled:
-            # Total switch from the file: no patches apply.
+            # The master environment switch may change before the freeze.
             for record in self._records.values():
                 if record.status == "pending":
-                    record.status, record.detail = "skipped", "disabled by configuration"
+                    record.status, record.detail = (
+                        "skipped",
+                        "disabled by configuration",
+                    )
             self._config_ready = True
             return
         self._config_ready = True
@@ -352,10 +383,10 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _check_engine_overlap(self) -> None:
-        """Refuse to run alongside a known legacy patch engine (design §9.3)."""
+        """Refuse to run alongside a known legacy patch engine."""
         for marker, name in (
             ("__megatron_musa_patch_import_watcher__", "megatron-musa-patch"),
-            ("__musa_adapter_import_watcher__", "musa-adapter (round 1)"),
+            ("__musa_adapter_import_watcher__", "musa-adapter"),
         ):
             if any(getattr(finder, marker, False) for finder in sys.meta_path):
                 raise EngineOverlapError(
@@ -365,14 +396,22 @@ class Engine:
                 )
         for module_name, name in (
             ("megatron_musa_patch", "megatron-musa-patch"),
-            ("musa_adapter", "musa-adapter (round 1)"),
+            ("musa_adapter", "musa-adapter"),
         ):
             module = sys.modules.get(module_name)
-            if module is not None:
+            active = vars(module).get("is_applied") if module is not None else None
+            if callable(active) and active():
                 raise EngineOverlapError(
-                    f"{name} is already imported in this process; overlapping "
-                    "patch engines are not supported. Start a new process."
+                    f"{name} has active patches in this process; start a new process."
                 )
+        internal = sys.modules.get("musa_adapter._internal")
+        runtime = vars(internal).get("_RUNTIME") if internal is not None else None
+        if runtime is not None and (
+            getattr(runtime, "activated", False) or getattr(runtime, "_undo_stack", ())
+        ):
+            raise EngineOverlapError(
+                "musa-adapter has active patches; start a new process"
+            )
 
     def install(self, *, config_path: str | None = None, eager: bool = True) -> None:
         """Watch future imports and patch fully imported targets immediately.
@@ -383,23 +422,30 @@ class Engine:
         """
         if not self.config.enabled():
             return
+        if config_path is not None:
+            self.config.set_config_path(config_path)
         if self._installed:
             if eager:
                 self._ensure_config()
             return
         for record in self._records.values():
-            if record.status == "reverted":
+            if record.status in {"reverted", "skipped"}:
                 # A fresh install after a clean uninstall may re-apply.
                 record.status, record.detail = "pending", "reinstall"
 
-        if self._bindings or any(
-            isinstance(item, HookPatch) and self._records[item.id].status == "failed"
-            for item in self._undo_order
+        if (
+            self._bindings
+            or self._failed_mutations
+            or any(
+                isinstance(item, HookPatch)
+                and self._records[item.id].status == "failed"
+                for item in self._undo_order
+            )
         ):
-            raise PatchConflict("patch cleanup is incomplete; retry uninstall() before install()")
+            raise PatchConflict(
+                "patch cleanup is incomplete; retry uninstall() before install()"
+            )
         self._check_engine_overlap()
-        if config_path is not None:
-            self.config.set_config_path(config_path)
         self._installed = True
         try:
             sys.meta_path.insert(0, self._watcher)
@@ -437,7 +483,10 @@ class Engine:
         patches = self._attrs.pop(fullname, []) + self._hooks.pop(fullname, [])
         for patch in patches:
             record = self._records[patch.id]
-            record.status, record.detail = "skipped", f"module {fullname!r} is not installed"
+            record.status, record.detail = (
+                "skipped",
+                f"module {fullname!r} is not installed",
+            )
 
     def _mark_namespace(self, fullname: str) -> None:
         """A namespace package has no execution body: hooks here are invalid,
@@ -478,17 +527,25 @@ class Engine:
                 try:
                     gate_detail = self._version_gate_block(patch)
                     if gate_detail is not None:
-                        record.status, record.detail = "skipped", f"version gate: {gate_detail}"
+                        record.status, record.detail = (
+                            "skipped",
+                            f"version gate: {gate_detail}",
+                        )
                         self._log(record)
                         continue
                     result = patch.run()
                 except Exception as exc:
                     # A failing hook must have cleaned its own partial
-                    # mutations; the engine records and propagates (§5.5).
-                    record.status, record.detail = "failed", f"{type(exc).__name__}: {exc}"
+                    # mutations; the engine records and propagates.
+                    record.status, record.detail = (
+                        "failed",
+                        f"{type(exc).__name__}: {exc}",
+                    )
                     raise
                 record.status = "skipped" if result is False else "applied"
-                record.detail = "hook declined to run" if result is False else "hook completed"
+                record.detail = (
+                    "hook declined to run" if result is False else "hook completed"
+                )
                 if result is not False:
                     self._undo_order.append(patch)
                 self._log(record)
@@ -590,7 +647,9 @@ class Engine:
     # Target application (ported transaction)
     # ------------------------------------------------------------------
 
-    def _apply_target(self, module, attr: str, patches: list[AttrPatch], trigger: str) -> None:
+    def _apply_target(
+        self, module, attr: str, patches: list[AttrPatch], trigger: str
+    ) -> None:
         key = (module.__name__, attr)
         previous = self._bindings.get(key)
         active = patches[0]
@@ -599,19 +658,32 @@ class Engine:
             reasons = {p.id: self._skip_reason(p) for p in patches}
             # Ineligible consumers need not expose their target symbol. Resolve
             # only when a factory can run or an existing binding needs cleanup.
-            if previous is None and all(detail is not None for detail in reasons.values()):
+            if previous is None and all(
+                detail is not None for detail in reasons.values()
+            ):
                 for patch in patches:
                     record = self._records[patch.id]
                     record.status, record.detail = "skipped", reasons[patch.id] or ""
                     self._log(record)
                 return
             owner_path, _, leaf = attr.rpartition(".")
-            owner = require_attr(module, owner_path, patch_id=active.id, target=active.target) if owner_path else module
+            owner = (
+                require_attr(
+                    module, owner_path, patch_id=active.id, target=active.target
+                )
+                if owner_path
+                else module
+            )
             require_attr(module, attr, patch_id=active.id, target=active.target)
             raw = inspect.getattr_static(owner, leaf)
-            if previous is not None and previous.owner is owner and raw is previous.replacement:
+            if (
+                previous is not None
+                and previous.owner is owner
+                and raw is previous.replacement
+            ):
                 if all(
-                    self._records[p.id].status in {"applied", "skipped"} for p in patches
+                    self._records[p.id].status in {"applied", "skipped"}
+                    for p in patches
                 ) and not any(
                     self._records[p.id].detail.startswith("requires ")
                     and all(self.is_applied(pid) for pid in p.requires)
@@ -650,6 +722,10 @@ class Engine:
                     replacement = type(current)(replacement)
                 current = replacement
                 outcomes.append((active, "applied", f"trigger={trigger}"))
+            if inspect.getattr_static(owner, leaf) is not raw:
+                raise PatchConflict(
+                    f"patch target {key!r} changed while its factories ran"
+                )
             if any(status == "applied" for _, status, _ in outcomes):
                 binding = _Binding(owner, leaf, baseline, current, leaf in vars(owner))
                 mutations.append((owner, leaf, raw, leaf in vars(owner), current))
@@ -659,13 +735,19 @@ class Engine:
                     # generation after reload. Keep their original undo values.
                     for consumer, name, _original in previous.aliases:
                         if vars(consumer).get(name) is previous.replacement:
-                            mutations.append((consumer, name, previous.replacement, True, current))
+                            mutations.append(
+                                (consumer, name, previous.replacement, True, current)
+                            )
                             setattr(consumer, name, current)
                             binding.aliases.append((consumer, name, baseline))
-                    binding.owned = previous.owned if previous.owner is owner else binding.owned
+                    binding.owned = (
+                        previous.owned if previous.owner is owner else binding.owned
+                    )
                 if not owner_path:
                     prefixes = tuple(
-                        dict.fromkeys(prefix for p in patches for prefix in p.rebind_prefixes)
+                        dict.fromkeys(
+                            prefix for p in patches for prefix in p.rebind_prefixes
+                        )
                     )
                     # An explicitly registered target has its own lifecycle.
                     # Rebinding it as a consumer would invalidate its ownership.
@@ -675,24 +757,42 @@ class Engine:
                     if previous is not None and previous.replacement is not raw:
                         sources.append(previous.replacement)
                     for source in sources:
-                        aliases = _rebind_aliases(module, leaf, source, current, prefixes, declared)
-                        for consumer, name, old in aliases:
-                            mutations.append((consumer, name, old, True, current))
+                        aliases = _rebind_aliases(
+                            module, leaf, source, current, prefixes, declared, mutations
+                        )
+                        for consumer, name, _old in aliases:
                             binding.aliases.append((consumer, name, baseline))
                 self._bindings[key] = binding
                 if key not in self._undo_order:
                     self._undo_order.append(key)
             elif previous is not None:
+                # Late registration can retire the entire chain without a
+                # reload replacing the target first. Restore our own binding
+                # before dropping its cleanup record, including inheritance.
+                if previous.owner is owner and raw is previous.replacement:
+                    mutations.append((owner, leaf, raw, True, baseline))
+                    if previous.owned:
+                        setattr(owner, leaf, baseline)
+                    else:
+                        delattr(owner, leaf)
                 # Reload may make a conditional patch unnecessary. Consumers
                 # holding the old replacement must follow the new upstream
                 # baseline rather than keeping a retired wrapper indefinitely.
                 for consumer, name, _ in previous.aliases:
                     if vars(consumer).get(name) is previous.replacement:
-                        mutations.append((consumer, name, previous.replacement, True, baseline))
+                        mutations.append(
+                            (consumer, name, previous.replacement, True, baseline)
+                        )
                         setattr(consumer, name, baseline)
                 declared = self._declared_targets()
                 _rebind_aliases(
-                    owner, leaf, previous.replacement, baseline, previous.rebind_prefixes, declared
+                    owner,
+                    leaf,
+                    previous.replacement,
+                    baseline,
+                    previous.rebind_prefixes,
+                    declared,
+                    mutations,
                 )
                 self._bindings.pop(key)
                 self._undo_order.remove(key)
@@ -701,20 +801,38 @@ class Engine:
                 record.status, record.detail = status, detail
                 self._log(record)
         except Exception as exc:
-            for changed_owner, name, old, owned, replacement in reversed(mutations):
-                if inspect.getattr_static(changed_owner, name, None) is replacement:
-                    if owned:
-                        setattr(changed_owner, name, old)
-                    else:
-                        delattr(changed_owner, name)
+            rollback_errors = self._rollback(mutations)
             record = self._records[active.id]
             record.status, record.detail = "failed", f"{type(exc).__name__}: {exc}"
+            if rollback_errors:
+                record.detail += f"; rollback incomplete: {rollback_errors[0]}"
+                raise TrainingMusaAdaptorError(
+                    f"patch {active.id!r} failed: {exc}; rollback incomplete: "
+                    f"{rollback_errors[0]}; retry uninstall() before applying"
+                ) from exc
             if isinstance(exc, TrainingMusaAdaptorError):
                 raise
             raise TrainingMusaAdaptorError(
                 f"patch {active.id!r} failed for {active.target!r} "
                 f"(trigger={trigger}): {type(exc).__name__}: {exc}"
             ) from exc
+
+    def _rollback(self, mutations: list[tuple]) -> list[Exception]:
+        """Try every inverse write, retaining only failures for uninstall retry."""
+        errors = []
+        failed = []
+        for owner, name, old, owned, replacement in reversed(mutations):
+            try:
+                if inspect.getattr_static(owner, name, None) is replacement:
+                    if owned:
+                        setattr(owner, name, old)
+                    else:
+                        delattr(owner, name)
+            except Exception as exc:
+                errors.append(exc)
+                failed.append((owner, name, old, owned, replacement))
+        self._failed_mutations.extend(reversed(failed))
+        return errors
 
     def _log(self, record: AppliedPatch) -> None:
         level = logging.INFO if self.config.debug() else logging.DEBUG
@@ -734,14 +852,14 @@ class Engine:
         if not patch_ids:
             raise ValueError(
                 "apply() requires explicit patch_ids; full-target import is not "
-                "offered (design doc §7.3)"
+                "offered"
             )
         if not self.config.enabled():
             return
-        self.install()
         unknown = set(patch_ids) - set(self._records)
         if unknown:
             raise ConfigError(f"unknown patch id(s) for apply(): {sorted(unknown)}")
+        self.install()
         self._ensure_config()
         modules: dict[str, list[Patch]] = {}
         for patch_id in patch_ids:
@@ -754,7 +872,10 @@ class Engine:
                 try:
                     module = importlib.import_module(module_name)
                 except ModuleNotFoundError as exc:
-                    if exc.name and (module_name == exc.name or module_name.startswith(exc.name + ".")):
+                    if exc.name and (
+                        module_name == exc.name
+                        or module_name.startswith(exc.name + ".")
+                    ):
                         self._mark_absent(module_name)
                         continue
                     self._mark_import_failed(module_name, exc)
@@ -766,7 +887,7 @@ class Engine:
                 continue
             module = sys.modules[module_name]
             # Already imported: attr patches may still apply (late, caveated);
-            # hooks are phase_missed and never re-run late (design §7.3).
+            # hooks are phase_missed and never re-run late.
             for patch in modules[module_name]:
                 if isinstance(patch, HookPatch):
                     record = self._records[patch.id]
@@ -797,8 +918,9 @@ class Engine:
         self._config_ready = False
         self._attrs.clear()
         self._hooks.clear()
-        errors = []
-        retained: list[Union[tuple[str, str], HookPatch]] = []
+        failed_mutations, self._failed_mutations = self._failed_mutations, []
+        errors = self._rollback(failed_mutations)
+        retained: list[tuple[str, str] | HookPatch] = []
         targets = self._declared_targets()
         for item in reversed(self._undo_order):
             if isinstance(item, HookPatch):
@@ -827,7 +949,10 @@ class Engine:
                             isinstance(owned, AttrPatch)
                             and (owned.module_name, owned.attr_name) == item
                         ):
-                            record.status, record.detail = "failed", f"undo failed: {exc}"
+                            record.status, record.detail = (
+                                "failed",
+                                f"undo failed: {exc}",
+                            )
                 else:
                     self._bindings.pop(item)
         self._undo_order = list(reversed(retained))
@@ -839,7 +964,11 @@ class Engine:
             and (record.patch.module_name, record.patch.attr_name) in retained
         )
         for record in self._records.values():
-            if record.patch.id not in retained_ids and record.status != "skipped":
+            if (
+                not self._failed_mutations
+                and record.patch.id not in retained_ids
+                and record.status != "skipped"
+            ):
                 if record.status in {"applied", "failed"}:
                     record.status, record.detail = "reverted", "uninstalled"
         if errors:
@@ -855,7 +984,7 @@ class Engine:
 
     def report(self) -> dict:
         config_dict: dict[str, Any]
-        if self._config_ready:
+        if self.config.frozen:
             config_dict = self.config.config.as_dict()
         else:
             config_dict = {"frozen": False}
@@ -863,6 +992,18 @@ class Engine:
             "patches": [record.as_dict() for record in self._records.values()],
             "config": config_dict,
             "restart_required": list(self._restart_required),
+            "cleanup_pending": bool(self._failed_mutations)
+            or (
+                not self._installed
+                and (
+                    bool(self._bindings)
+                    or any(
+                        isinstance(item, HookPatch)
+                        and self._records[item.id].status == "failed"
+                        for item in self._undo_order
+                    )
+                )
+            ),
             "pending_modules": self.pending_modules(),
         }
 
@@ -880,13 +1021,21 @@ class Engine:
         return iter(self._records.values())
 
 
-def _rebind_aliases(module, attr: str, old: Any, new: Any, prefixes: tuple[str, ...], targets: set):
+def _rebind_aliases(
+    module,
+    attr: str,
+    old: Any,
+    new: Any,
+    prefixes: tuple[str, ...],
+    targets: set,
+    mutations: list | None = None,
+):
     """Bounded same-name alias repair; never scan attributes via __getattr__.
 
     Only modules under the explicitly declared prefixes are inspected
     (rebind_prefixes defaults to empty); primitive flags are never rebound.
-    Transactional: a failure in one consumer rolls back the aliases already
-    rebound, so the caller's binding stays the single source of truth.
+    Application writes join the caller's rollback log. During uninstall,
+    the existing binding remains available for retry if an inverse fails.
     """
     if not prefixes:
         return []
@@ -894,19 +1043,19 @@ def _rebind_aliases(module, attr: str, old: Any, new: Any, prefixes: tuple[str, 
         return []
     aliases: list[tuple[types.ModuleType, str, Any]] = []
     for name, consumer in list(sys.modules.items()):
-        if (name, attr) in targets or consumer is module or type(consumer) is not types.ModuleType:
+        if (
+            (name, attr) in targets
+            or consumer is module
+            or type(consumer) is not types.ModuleType
+        ):
             continue
-        if not any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
+        if not any(
+            name == prefix or name.startswith(prefix + ".") for prefix in prefixes
+        ):
             continue
         if attr in vars(consumer) and vars(consumer)[attr] is old:
-            try:
-                setattr(consumer, attr, new)
-            except Exception:
-                for rollback_module, rollback_attr, rollback_old in reversed(aliases):
-                    try:
-                        setattr(rollback_module, rollback_attr, rollback_old)
-                    except Exception:  # noqa: BLE001 - best effort rollback
-                        pass
-                raise
+            if mutations is not None:
+                mutations.append((consumer, attr, old, True, new))
+            setattr(consumer, attr, new)
             aliases.append((consumer, attr, old))
     return aliases

@@ -9,13 +9,12 @@ subclass transfers. No torch or accelerator package is imported at module load.
 Idempotent shared helper
 ------------------------
 :func:`ensure_cuda_compat` is the single device-preparation entry point every
-framework hook calls at its own verified import boundary (design doc §4.2,
-last rule). It is idempotent, records ownership/cleanup/failure state in this
+framework hook calls at its own verified import boundary. It is idempotent, records ownership/cleanup/failure state in this
 module, and returns whether *this call* installed the layer (``True``) so the
 calling hook can own the undo. It declines (``False``) when the layer is
 already active -- undo ownership stays with whoever installed it -- and when
 no MUSA device is visible: CPU/CUDA processes keep their original behavior
-and ``torchada`` is never imported (design doc §5.1).
+and ``torchada`` is never imported.
 
 Mutation boundary
 -----------------
@@ -29,12 +28,6 @@ overrides back. Use a fresh process to remove the external adapters completely.
 Our overrides operate in place on the objects exposed by the adapter. Undo is
 identity-checked so a subsequent third-party replacement is not overwritten.
 References captured elsewhere while the layer was active cannot be revoked.
-
-Migrated from megatron-musa-patch ``backends/torch_cuda.py`` (rev a1090de);
-behavior and rollback journal semantics are unchanged, the error guidance now
-names the TRAINING_MUSA_ADAPTOR switches, and the multi-framework idempotent
-entry point (:func:`ensure_cuda_compat`) replaces the old hook-local
-``is_applied`` guard.
 """
 
 from __future__ import annotations
@@ -172,13 +165,18 @@ def _alias_graph_apis(torch: Any, musa: Any) -> None:
         ("CUDAGraph", getattr(musa, "MUSAGraph", None)),
         ("graph", getattr(musa, "graph", None)),
         ("graph_pool_handle", getattr(musa, "graph_pool_handle", None)),
-        ("is_current_stream_capturing", getattr(musa, "is_current_stream_capturing", None)),
+        (
+            "is_current_stream_capturing",
+            getattr(musa, "is_current_stream_capturing", None),
+        ),
     )
     for name, musa_api in replacements:
         if musa_api is None:  # Some backend releases do not expose graph support.
             continue
         current = getattr(torch.cuda, name, None)
-        if current is musa_api or getattr(current, "__module__", "").startswith("torch_musa"):
+        if current is musa_api or getattr(current, "__module__", "").startswith(
+            "torch_musa"
+        ):
             continue
         _set_attr(torch.cuda, name, musa_api)
     graphs = sys.modules.get("torch.cuda.graphs", getattr(musa, "graphs", None))
@@ -248,7 +246,9 @@ def _fix_tensor_musa_for_subclasses(torch: Any) -> None:
         device = _resolve_musa_device(device)
         if device.type != "musa":
             raise RuntimeError(f"Invalid device, must be musa device: {device}")
-        return self.to(device=device, non_blocking=non_blocking, memory_format=memory_format)
+        return self.to(
+            device=device, non_blocking=non_blocking, memory_format=memory_format
+        )
 
     @functools.wraps(original_musa)
     def _musa(self, *args, **kwargs):
@@ -328,7 +328,9 @@ def apply() -> None:
         if not torchada.is_patched():
             torchada.apply_patches()
         if not torchada.is_patched():
-            raise MusaUnavailable("torchada did not finish installing its MUSA adapter.")
+            raise MusaUnavailable(
+                "torchada did not finish installing its MUSA adapter."
+            )
 
         try:
             _alias_availability(torch, musa)
@@ -350,7 +352,7 @@ def apply() -> None:
 
 
 def ensure_cuda_compat() -> bool:
-    """Idempotent device preparation for framework hooks (design doc §4.2).
+    """Idempotent device preparation for framework hooks.
 
     Every framework hook calls this one helper at its own verified import
     boundary instead of depending on another framework's patch. Returns
@@ -361,7 +363,7 @@ def ensure_cuda_compat() -> bool:
       installer, whether that was an earlier hook or explicit caller code),
       or
     - no MUSA device is visible: CPU/CUDA processes keep their original
-      behavior and ``torchada`` is never imported (design doc §5.1).
+      behavior and ``torchada`` is never imported.
 
     A MUSA machine whose stack is broken (torchada missing, adapter refused
     to patch) still raises the actionable :class:`MusaUnavailable` from

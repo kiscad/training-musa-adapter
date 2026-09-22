@@ -1,4 +1,4 @@
-"""Small diagnostic CLI (design doc §7.3).
+"""Small diagnostic CLI.
 
 Read-only: ``list`` and ``config`` load declarations/configuration only,
 ``report`` describes the *current CLI process* -- it is never a running
@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 from . import __version__
 from ._errors import TrainingMusaAdaptorError
@@ -40,10 +40,14 @@ def _cmd_list(_args) -> int:
 
 def _cmd_config(_args) -> int:
     from ._config import ConfigManager
+    from .patches import PATCH_SUITES
 
     manager = ConfigManager()
     # CLI config inspection freezes only this diagnostic process.
-    config = manager.freeze(registered_patch_ids={patch.id for patch in _load_patches()})
+    config = manager.freeze(
+        registered_patch_ids={patch.id for patch in _load_patches()},
+        patch_suites=PATCH_SUITES,
+    )
     print(json.dumps(config.as_dict(), indent=2))
     return _EXIT_OK
 
