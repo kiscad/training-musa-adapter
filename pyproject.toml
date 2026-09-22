@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 # training-musa-adaptor versions independently of any upstream framework
-# (design doc §1.2); upstream version ranges live in each patch's
+#; upstream version ranges live in each patch's
 # version_gates and in the validation matrix.
 name = "training-musa-adaptor"
 version = "0.1.0.dev0"
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # Lazy-loaded at the first relevant import boundary, never on the bootstrap
-# path (design doc §7.1/§7.2).  torch / torch_musa / torchada / TE / mate /
+# path.  torch / torch_musa / torchada / TE / mate /
 # flash_attn come from the host environment and are intentionally NOT
 # declared here: installing the adaptor must not upgrade the vendor stack.
 dependencies = [
@@ -34,7 +34,8 @@ dependencies = [
 dev = ["pytest>=7", "pytest-cov"]
 
 # PyTorch's out-of-tree device-backend autoload hook: fires at the very end
-# of ``import torch``, before any framework module can run.  Kill switches:
+# of ``import torch``; framework imports already in progress need the audited
+# late boundaries declared in patches/platform.py. Kill switches:
 #   TORCH_DEVICE_BACKEND_AUTOLOAD=0    (torch's own channel switch)
 #   TRAINING_MUSA_ADAPTOR_AUTOLOAD=0   (ours; explicit API stays usable)
 [project.entry-points."torch.backends"]
@@ -59,3 +60,64 @@ markers = [
     "musa: needs a live MUSA stack (torch_musa + device); skipped otherwise",
     "integration: needs TMA_RUN_INTEGRATION=1",
 ]
+
+# Quality gates shared by the local hooks (scripts/ci/*) and CI; the check
+# scripts in scripts/ci/ run these tools with the dev container's own
+# versions (`language: system`), so "the runtime == the checked environment".
+[tool.black]
+# Pin to the package floor: black's safety check must parse its own output
+# with the running (3.10) interpreter.
+target-version = ["py310"]
+
+[tool.isort]
+# black-compatible import wrapping: the two gates must agree on one style.
+profile = "black"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+# Import ordering belongs to isort; ruff does not enable its I rules.
+select = ["E4", "E7", "E9", "F", "W", "B", "UP"]
+ignore = [
+    "E501", # line length is black's job; patch rationale/ledger strings stay unsplit
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Lambda stubs in tests (monkeypatch stand-ins) are idiomatic; do not force def.
+"tests/*" = ["E731"]
+# Hardware smokes mutate sys.path before importing vendor packages; E402 is intended.
+"tests/*_smoke.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = false
+exclude = ["build", "dist"]
+
+[[tool.mypy.overrides]]
+# These modules exist to setattr on foreign modules (the runtime patches);
+# the dynamic-attribute categories are disabled here, everything else is
+# still checked.
+module = ["training_musa_adaptor.patches.transformer_engine"]
+disable_error_code = ["attr-defined", "union-attr", "misc"]
+
+[[tool.mypy.overrides]]
+# Ports and self-checks that attach attributes to foreign objects (TE utils,
+# torch.Tensor weak refs) and fallback classes whose attributes mirror
+# foreign bases: same exemption, scoped to the dynamic-attribute categories.
+module = [
+    "training_musa_adaptor.patches.megatron.cuda_graphs",
+    "training_musa_adaptor.patches.megatron.rope",
+]
+disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+# The functional fallbacks subclass foreign TE/Megatron bases and re-assign
+# their attributes (Parameter<->Tensor) with TE's own dtype contract.
+module = ["training_musa_adaptor.patches.megatron.layer_norm"]
+disable_error_code = ["assignment", "attr-defined", "misc", "operator"]

@@ -1,0 +1,31 @@
+# 最终守护：本地 hook 可被 --no-verify 绕过，服务器端复用同一套检查脚本。
+# 说明：本仓库的单元套件在 CPU 上即可运行（MUSA 硬件用例按 importorskip
+# 跳过），因此 CI 使用轻量 CPU 环境，不需要 MUSA 厂商栈；重型硬件轮次
+# 属于专用硬件 runner（见 AGENTS.md「开工与验证」一节）。
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    container: python:3.10-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (lightweight CI stage)
+        run: |
+          python -m pip install --quiet \
+            ruff==0.16.8 black==26.5.1 isort==5.13.2 mypy pytest \
+            torch --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
+
+      - name: Install package (editable, no deps)
+        run: python -m pip install --no-deps -e .
+
+      - name: Run checks (same scripts as local pre-push)
+        run: bash scripts/ci/pre-push.sh

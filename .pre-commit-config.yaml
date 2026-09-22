@@ -1,0 +1,35 @@
+# 本地开发门禁（容器内触发）：检查逻辑统一在 scripts/ci/*，
+# 本地 hook 与 CI 复用同一套脚本。工具全部使用开发容器内
+# 已安装的版本（language: system），保证「运行环境 == 检查环境」。
+# 安装： bash scripts/setup-dev-hooks.sh
+# 手动全量： pre-commit run --all-files
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+
+repos:
+  - repo: local
+    hooks:
+      # Level 1（commit）：快速静态检查
+      - id: quick-check
+        name: quick checks (ruff / black / isort)
+        entry: bash scripts/ci/quick-check.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # Level 2（push）：完整 lint + 类型检查
+      - id: lint
+        name: full lint (ruff / black / isort / mypy)
+        entry: bash scripts/ci/lint.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      # Level 2（push）：CPU/轻量单元测试
+      - id: unit-tests
+        name: unit tests
+        entry: bash scripts/ci/unit-tests.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
