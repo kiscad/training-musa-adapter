@@ -1,11 +1,7 @@
-# 来源: megatron-musa-patch/tests/test_activation.py
-# 主要适配点: v2.0 §7.3 —— `import training_musa_adaptor` 不再自动 install
-# (旧首个用例反转: 显式 install()/uninstall() 才装/卸 watcher); 自动通道只有
-# torch.backends entry point, kill switch 改名 TRAINING_MUSA_ADAPTOR_AUTOLOAD;
-# 新入口不检查 torch 模块状态(旧 fake-torch spec 舞步删除), eager=False 只装
-# watcher、配置延迟到首个相关边界冻结; 子进程不再注入 PYTHONPATH(包已安装);
-# 旧"禁用的 apply 不探测 megatron"改为"禁用的激活完全不触碰引擎"(v2.0 引擎
-# 框架无关, 没有 megatron 探针).
+# 要点: `import training_musa_adaptor` 不自动 install——显式 install()/uninstall()
+# 才装/卸 watcher; 自动通道只有 torch.backends entry point, kill switch 为
+# TRAINING_MUSA_ADAPTOR_AUTOLOAD; eager=False 只装 watcher、配置延迟到首个
+# 相关边界冻结; 禁用的激活完全不触碰引擎; 子进程不注入 PYTHONPATH(包已安装).
 """Public activation and entry-point loading, isolated from unit registries."""
 
 from __future__ import annotations
@@ -22,7 +18,8 @@ def _run(script, **switches):
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("MEGATRON_MUSA_PATCH") and not k.startswith("TRAINING_MUSA_ADAPTOR_")
+        if not k.startswith("MEGATRON_MUSA_PATCH")
+        and not k.startswith("TRAINING_MUSA_ADAPTOR_")
     }
     env.update(switches)
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -43,7 +40,7 @@ def test_explicit_import_never_installs_anything():
         assert 'torch' not in sys.modules
         assert 'megatron' not in sys.modules
         from training_musa_adaptor import activation
-        # v2.0: importing the package alone installs no watcher (design §7.3).
+        # importing the package alone installs no watcher.
         assert not activation.ENGINE._installed
         assert not any(
             getattr(f, '__training_musa_adaptor_import_watcher__', False)
@@ -67,7 +64,7 @@ def test_autoload_entrypoint_installs_only_the_watcher():
         m.torch_backend_autoload()
         assert activation.ENGINE._installed
         # eager=False: config parsing is deferred to the first relevant
-        # import boundary so `import torch` stays light (design §7.1).
+        # import boundary so `import torch` stays light.
         assert not activation.ENGINE._config_ready
         assert not activation.bootstrap_errors
         m.uninstall()
@@ -105,9 +102,7 @@ def test_entrypoint_catches_install_failure():
 
 def test_disabled_activation_never_touches_the_engine(monkeypatch):
     """TRAINING_MUSA_ADAPTOR_ENABLED=0 is a hard exit: install()/apply()
-    return before registering, scheduling or touching the watcher.  (The old
-    test guarded a Megatron probe; v2.0's engine is framework-agnostic and
-    has no such probe to guard.)"""
+    return before registering, scheduling or touching the watcher."""
     from training_musa_adaptor import activation
 
     monkeypatch.setenv("TRAINING_MUSA_ADAPTOR_ENABLED", "0")

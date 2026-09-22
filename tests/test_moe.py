@@ -83,7 +83,12 @@ def _permute_env(stub_module, dtype_marker="fp32"):
     calls = []
 
     def original(
-        tokens, routing_map, probs=None, num_out_tokens=None, fused=False, drop_and_pad=False
+        tokens,
+        routing_map,
+        probs=None,
+        num_out_tokens=None,
+        fused=False,
+        drop_and_pad=False,
     ):
         calls.append(
             {
@@ -106,7 +111,9 @@ def _permute_env(stub_module, dtype_marker="fp32"):
         musa=SimpleNamespace(is_available=lambda: True),
     )
     stub_module("torch.distributed", ReduceOp=reduce_op)
-    patch = next(p for p in _moe.PATCHES if p.id == "megatron.moe.permutation.unfused-musa")
+    patch = next(
+        p for p in _moe.PATCHES if p.id == "megatron.moe.permutation.unfused-musa"
+    )
     wrapped = patch.replace(original)
 
     class Tensor:
@@ -127,7 +134,12 @@ def test_permute_demotes_fused_for_broken_dtypes(stub_module):
         None,
         "indices",
     )
-    assert calls[-1] == {"fused": False, "probs": None, "num_out_tokens": 8, "drop_and_pad": False}
+    assert calls[-1] == {
+        "fused": False,
+        "probs": None,
+        "num_out_tokens": 8,
+        "drop_and_pad": False,
+    }
     # float64 is broken as well
     wrapped(Tensor("fp64"), routing_map, fused=True)
     assert calls[-1]["fused"] is False
@@ -177,6 +189,139 @@ def test_unpermute_requires_its_permute_companion(stub_module):
     assert calls[-1] is False
 
 
+def _permute_core17_env(stub_module):
+    calls = []
+
+    def original(tokens, routing_map, *args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return "permuted"
+
+    reduce_op = SimpleNamespace(SUM="SUM")
+    stub_module(
+        "torch",
+        float32="fp32",
+        float64="fp64",
+        float16="fp16",
+        bfloat16="bf16",
+        distributed=SimpleNamespace(ReduceOp=reduce_op),
+        musa=SimpleNamespace(is_available=lambda: True),
+    )
+    stub_module("torch.distributed", ReduceOp=reduce_op)
+    patch = next(
+        p
+        for p in _moe.PATCHES
+        if p.id == "megatron.moe.permutation.unfused-musa.core17"
+    )
+    wrapped = patch.replace(original)
+
+    class Tensor:
+        device = SimpleNamespace(type="musa")
+        shape = (4, 2)
+
+        def __init__(self, dtype):
+            self.dtype = dtype
+
+    return wrapped, calls, Tensor
+
+
+def test_permute_core17_forwards_new_kwargs_and_demotes(stub_module):
+    """The core>=0.17 variant forwards tokens_per_expert/align_size untouched
+    and flips only the fused keyword for broken dtypes."""
+    wrapped, calls, Tensor = _permute_core17_env(stub_module)
+    wrapped(
+        Tensor("fp32"),
+        "map",
+        fused=True,
+        num_out_tokens=8,
+        tokens_per_expert="t",
+        align_size=16,
+    )
+    assert calls[-1] == {
+        "args": (),
+        "kwargs": {
+            "fused": False,
+            "num_out_tokens": 8,
+            "tokens_per_expert": "t",
+            "align_size": 16,
+        },
+    }
+    # float16/bfloat16 keep the fused kernel, new kwargs still forwarded
+    wrapped(Tensor("fp16"), "map", fused=True, align_size=-1)
+    assert calls[-1]["kwargs"] == {"fused": True, "align_size": -1}
+    # a call without the fused keyword passes through untouched
+    wrapped(Tensor("fp64"), "map")
+    assert calls[-1] == {"args": (), "kwargs": {}}
+
+
+def test_moe_core17_unpermute_pairs_with_its_permute_companion(stub_module):
+    reduce_op = SimpleNamespace(SUM="SUM")
+    stub_module(
+        "torch",
+        float32="fp32",
+        float64="fp64",
+        float16="fp16",
+        bfloat16="bf16",
+        distributed=SimpleNamespace(ReduceOp=reduce_op),
+        musa=SimpleNamespace(is_available=lambda: True),
+    )
+    stub_module("torch.distributed", ReduceOp=reduce_op)
+    patches = {p.id: p for p in _moe.PATCHES}
+    permute = patches["megatron.moe.permutation.unfused-musa.core17"]
+    unpermute = patches["megatron.moe.unpermutation.unfused-musa.core17"]
+    assert unpermute.requires == (permute.id,)
+
+    calls = []
+
+    def original(permuted_tokens, *args, **kwargs):
+        calls.append(kwargs)
+        return "restored"
+
+    fp32 = SimpleNamespace(
+        dtype="fp32", device=SimpleNamespace(type="musa"), shape=(4, 2)
+    )
+    bf16 = SimpleNamespace(
+        dtype="bf16", device=SimpleNamespace(type="musa"), shape=(4, 2)
+    )
+    wrapped = unpermute.replace(original)
+    assert (
+        wrapped(fp32, "idx", torch.Size([4, 2]), fused=True, pad_offsets="p")
+        == "restored"
+    )
+    assert calls[-1] == {"fused": False, "pad_offsets": "p"}
+    # bfloat16 keeps the fused kernel
+    wrapped(bf16, "idx", torch.Size([4, 2]), fused=True)
+    assert calls[-1] == {"fused": True}
+
+
+def test_moe_permutation_gates_tile_core_0_11_through_0_19():
+    """The 0.11-0.16 patch and the core17 variant must tile the release
+    lines: exactly one of them applies for any core in 0.11..0.19."""
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
+
+    gates = {
+        p.id: p.version_gates
+        for p in _moe.PATCHES
+        if p.id.startswith("megatron.moe.permutation.unfused-musa")
+    }
+    assert set(gates) == {
+        "megatron.moe.permutation.unfused-musa",
+        "megatron.moe.permutation.unfused-musa.core17",
+    }
+    for version in ("0.11.0", "0.13.0", "0.16.1", "0.17.0", "0.18.0", "0.19.0"):
+        hits = [
+            pid
+            for pid, specs in gates.items()
+            if any(
+                SpecifierSet(spec.split(" ", 1)[1], prereleases=True).contains(
+                    Version(version)
+                )
+                for spec in specs
+            )
+        ]
+        assert len(hits) == 1, (version, hits)
+
+
 def test_moe_topk_declines_when_fp64_topk_works(monkeypatch):
     from training_musa_adaptor.patches.megatron import moe as _moe
 
@@ -223,7 +368,9 @@ def test_fp64_topk_preserves_named_result():
     scores = torch.tensor([0.1, 0.3, 0.2], dtype=torch.float64)
     result = _moe._fp64_topk(torch, scores, 2, None, True, True)
     assert isinstance(result, torch.return_types.topk)
-    torch.testing.assert_close(result.values, torch.tensor([0.3, 0.2], dtype=torch.float64))
+    torch.testing.assert_close(
+        result.values, torch.tensor([0.3, 0.2], dtype=torch.float64)
+    )
     assert result.indices.tolist() == [1, 2]
 
 
@@ -236,7 +383,9 @@ def test_fp64_musa_out_is_delegated(monkeypatch):
     outputs = (object(), object())
     monkeypatch.setattr(_moe, "_musa_live", lambda: True)
     result = _moe._MoeTorchProxy(namespace).topk(scores, 2, out=outputs)
-    native.assert_called_once_with(scores, 2, dim=None, largest=True, sorted=True, out=outputs)
+    native.assert_called_once_with(
+        scores, 2, dim=-1, largest=True, sorted=True, out=outputs
+    )
     assert result is native.return_value
 
 
@@ -250,7 +399,11 @@ def _bridge_entry_points():
         fused_topk_with_score_function,
     )
 
-    return fused_topk_with_score_function, fused_moe_aux_loss, fused_compute_score_for_moe_aux_loss
+    return (
+        fused_topk_with_score_function,
+        fused_moe_aux_loss,
+        fused_compute_score_for_moe_aux_loss,
+    )
 
 
 tk_router = pytest.importorskip(
@@ -261,7 +414,9 @@ tk_router = pytest.importorskip(
 @pytest.fixture()
 def router_bridge_live(monkeypatch):
     monkeypatch.setattr(_moe, "_musa_live", lambda: True)
-    monkeypatch.setattr(_moe, "_torch_kernels_router_entry_points", _bridge_entry_points)
+    monkeypatch.setattr(
+        _moe, "_torch_kernels_router_entry_points", _bridge_entry_points
+    )
     return True
 
 
@@ -280,10 +435,11 @@ def test_fused_router_bridge_declines_for_real_te_symbol(router_bridge_live):
     assert _moe._SCORE_BRIDGE(sentinel) is None
 
 
-
 def test_fused_router_bridge_declines_without_musa(monkeypatch):
     monkeypatch.setattr(_moe, "_musa_live", lambda: False)
-    monkeypatch.setattr(_moe, "_torch_kernels_router_entry_points", _bridge_entry_points)
+    monkeypatch.setattr(
+        _moe, "_torch_kernels_router_entry_points", _bridge_entry_points
+    )
     assert _moe._TOPK_BRIDGE(None) is None
 
 
@@ -340,5 +496,19 @@ def test_bridged_aux_loss_matches_megatron_reference(router_bridge_live):
         topk=2,
         coeff=0.01,
     )
-    expected = (probs.sum(dim=0) * tokens_per_expert).sum() * (4 * 0.01 / (2 * 128 * 128))
+    expected = (probs.sum(dim=0) * tokens_per_expert).sum() * (
+        4 * 0.01 / (2 * 128 * 128)
+    )
     torch.testing.assert_close(loss, expected, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("with_out", [False, True])
+def test_topk_default_dimension_matches_native(with_out):
+    scores = torch.tensor([[1.0, 3.0, 2.0], [6.0, 4.0, 5.0]])
+    kwargs = {}
+    if with_out:
+        kwargs["out"] = (torch.empty(2, 2), torch.empty(2, 2, dtype=torch.int64))
+    actual = _proxy().topk(scores, 2, **kwargs)
+    expected = torch.topk(scores, 2)
+    torch.testing.assert_close(actual.values, expected.values)
+    assert torch.equal(actual.indices, expected.indices)

@@ -1,11 +1,6 @@
-# 来源: megatron-musa-patch/tests/test_ledger.py
-# 主要适配点: 维护契约(唯一非空 id、rationale/strategy/upstream/remove_when、
-# 显式 MODULES、requires 可解析、补丁模块互不导入)原样保留, 作用于 v2.0 注册表
-# (当前 S2: megatron attention 一项); 删除仅属于旧包的检查——megatron 存在性探针
-# (megatron_importable/check_megatron_present, 引擎已框架无关)、SUPPORTED_VERSION_SPEC
-# /parse_version/_in_supported_range(无全局支持区间, 版本门控见 test_version_gates.py)、
-# _env.flag 解析(环境解析集中在 _config); 旧"默认 megatron scope/隐式 rebind"结构断言
-# 按 v2.0 重写(显式 rebind_prefixes、trigger 必须为具体模块); 新增 patches/ 顶层
+# 要点: 维护契约(唯一非空 id、rationale/strategy/upstream/remove_when、显式
+# MODULES、requires 可解析、补丁模块互不导入); rebind_prefixes 显式声明、
+# trigger 必须为具体模块; 版本门控见 test_version_gates.py; patches/ 顶层
 # 重依赖扫描与 find_spec_without_watchers 不唤醒 watcher 的探针测试.
 """Maintenance contract: every patch is identifiable and independently reviewable."""
 
@@ -32,21 +27,23 @@ def test_every_patch_has_an_actionable_maintenance_record(patch):
         value = getattr(patch, field)
         assert value.strip(), f"{patch.id} has no {field}"
         if field != "upstream":
-            assert len(value.split()) >= 3, f"{patch.id}: {field} must explain, not just label"
+            assert (
+                len(value.split()) >= 3
+            ), f"{patch.id}: {field} must explain, not just label"
         assert AppliedPatch(patch).as_dict()[field] == value
 
 
 def test_targets_and_hooks_have_explicit_scope():
-    """Structural scope invariants (v2.0): the old fixed megatron.* default
-    scope and its reviewed-exception table are gone -- alias repair is an
-    explicit per-patch declaration and hooks name concrete exec boundaries."""
+    """Alias scopes are explicit; hooks name concrete execution boundaries."""
     for patch in PATCHES:
         if isinstance(patch, AttrPatch):
             assert ":" in patch.target
             assert patch.module_name and patch.attr_name
-            # v2.0: rebind_prefixes defaults to empty on purpose; any
-            # non-empty scope is a deliberate, reviewed migration choice.
-            assert all(isinstance(prefix, str) and prefix for prefix in patch.rebind_prefixes)
+            # rebind_prefixes defaults to empty on purpose; any
+            # non-empty scope is a deliberate, reviewed alias-repair choice.
+            assert all(
+                isinstance(prefix, str) and prefix for prefix in patch.rebind_prefixes
+            )
         else:
             assert patch.trigger and all(
                 part.isidentifier() for part in patch.trigger.split(".")
@@ -59,6 +56,16 @@ def test_targets_and_hooks_have_explicit_scope():
 def test_each_module_exports_patch_tuple(module):
     assert isinstance(module.PATCHES, tuple)
     assert module.PATCHES
+
+
+def test_every_patch_belongs_to_exactly_one_declared_suite():
+    """Suite names in ONLY/DISABLE expand through this registry: coverage
+    must be total and unambiguous."""
+    from training_musa_adaptor.patches import PATCH_SUITES, SUITES
+
+    assert {patch.id for patch in PATCHES} == set(PATCH_SUITES)
+    assert set(PATCH_SUITES.values()) == set(SUITES)
+    assert len(PATCH_SUITES) == len(PATCHES)
 
 
 def test_companion_requirements_are_explicit_and_resolvable():
@@ -84,7 +91,8 @@ def test_patch_modules_do_not_import_other_patch_modules(module):
             assert not (node.module or "").startswith("training_musa_adaptor.patches")
         elif isinstance(node, ast.Import):
             assert not any(
-                alias.name.startswith("training_musa_adaptor.patches") for alias in node.names
+                alias.name.startswith("training_musa_adaptor.patches")
+                for alias in node.names
             )
 
 
@@ -120,14 +128,16 @@ def test_patch_modules_stay_stdlib_at_top_level():
             else:
                 continue
             offenders = roots & heavy
-            assert not offenders, f"{path.name} imports {sorted(offenders)} at top level"
+            assert (
+                not offenders
+            ), f"{path.name} imports {sorted(offenders)} at top level"
 
 
 def test_find_spec_probe_does_not_wake_the_import_watcher(engine, fake_package):
     """The internal existence probe skips every import watcher: querying a
     watched module neither fires hooks nor wraps the returned loader
     (replaces the old megatron_importable probe test, which does not exist
-    in the framework-agnostic v2.0 engine)."""
+    in the framework-agnostic engine)."""
     from training_musa_adaptor._imports import find_spec_without_watchers
 
     name = fake_package("probe_target", "value = 1\n")
@@ -139,3 +149,15 @@ def test_find_spec_probe_does_not_wake_the_import_watcher(engine, fake_package):
     assert spec is not None
     assert calls == []
     assert name not in set(sys.modules) - before
+
+
+def test_documented_patch_ids_cover_the_registry():
+    """The ledger must list real IDs individually, including related variants."""
+    import re
+    from pathlib import Path
+
+    ledger = Path(__file__).resolve().parents[1] / "docs" / "PATCH_LEDGER.md"
+    rows = re.findall(r"^\| `([^`]+)` \|", ledger.read_text(), re.MULTILINE)
+    assert len(rows) == len(set(rows)), "duplicate patch IDs in the ledger"
+    missing = {patch.id for patch in PATCHES} - set(rows)
+    assert not missing, f"undocumented patch IDs: {sorted(missing)}"

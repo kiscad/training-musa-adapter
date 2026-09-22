@@ -64,7 +64,9 @@ def test_delayed_constructor_requires_both_execution_patches():
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_delayed_patch_dependencies_and_uninstall(engine, stub_module, monkeypatch, reverse):
+def test_delayed_patch_dependencies_and_uninstall(
+    engine, stub_module, monkeypatch, reverse
+):
     monkeypatch.setattr(patch, "musa_available", lambda: True)
 
     class Linear:

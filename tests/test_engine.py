@@ -1,11 +1,7 @@
-# 来源: megatron-musa-patch/tests/test_engine.py
-# 主要适配点: import 路径与环境变量改名(TRAINING_MUSA_ADAPTOR_*); report() 变为
-# dict(用 ["patches"] 取记录); unapply()→uninstall(); Hook 边界改到真实 exec_module:
-# 新增 find_spec 查询不触发 Hook(3a)、已加载模块 Hook 标 phase_missed(3c)、namespace
-# trigger 标 failed(3b) 三个语义测试; ONLY/DISABLE 未知 ID 由告警改为 ConfigError;
-# 删除 IGNORE_VERSION_GATES 用例(开关不存在); 点号 target 写法改为拒绝; Hook 版本门控
-# 用例改用未导入的 fake 触发模块; 新增 apply(patch_ids) 必填校验与已知旧引擎重叠拒绝
-# (EngineOverlapError) 测试.
+# 要点: Hook 边界在真实 exec_module——find_spec 查询不触发 Hook、已加载模块的
+# Hook 标 phase_missed、namespace trigger 标 failed; ONLY/DISABLE 未知 ID 报
+# ConfigError; 点号 target 写法拒绝; Hook 版本门控在 exec 边界评估;
+# apply(patch_ids) 必填校验; 已知旧引擎重叠拒绝(EngineOverlapError).
 """Tests for the patch engine itself (no GPU, no framework required)."""
 
 from __future__ import annotations
@@ -28,7 +24,13 @@ from training_musa_adaptor._errors import (
 def test_applies_to_already_imported_module(engine, stub_module):
     module = stub_module("fake_already", value=1)
     engine.register(
-        [AttrPatch(id="t.already", target="fake_already:value", replace=lambda old: old + 41)]
+        [
+            AttrPatch(
+                id="t.already",
+                target="fake_already:value",
+                replace=lambda old: old + 41,
+            )
+        ]
     )
     engine.install()
 
@@ -39,7 +41,9 @@ def test_applies_to_already_imported_module(engine, stub_module):
 
 def test_applies_on_later_import(engine, fake_package):
     name = fake_package("fake_later", "value = 1\n")
-    engine.register([AttrPatch(id="t.later", target=f"{name}:value", replace=lambda old: old + 41)])
+    engine.register(
+        [AttrPatch(id="t.later", target=f"{name}:value", replace=lambda old: old + 41)]
+    )
     engine.install()
 
     assert not engine.is_applied("t.later")
@@ -63,7 +67,9 @@ def test_patch_sees_original_and_can_wrap(engine, stub_module):
 
         return wrapper
 
-    engine.register([AttrPatch(id="t.wrap", target="fake_wrap:compute", replace=make_wrapper)])
+    engine.register(
+        [AttrPatch(id="t.wrap", target="fake_wrap:compute", replace=make_wrapper)]
+    )
     engine.install()
 
     assert seen["original"] is original
@@ -85,7 +91,7 @@ def test_from_import_aliases_are_rebound(engine, fake_package, monkeypatch):
                 id="t.rebind",
                 target=f"{target}:fn",
                 replace=lambda old: (lambda: "patched"),
-                # v2.0: alias repair is an explicit, scoped choice
+                # alias repair is an explicit, scoped choice
                 # (rebind_prefixes defaults to empty).
                 rebind_prefixes=(consumer,),
             )
@@ -98,7 +104,9 @@ def test_from_import_aliases_are_rebound(engine, fake_package, monkeypatch):
 
 def test_uninstall_restores_original(engine, stub_module):
     module = stub_module("fake_undo", value=1)
-    engine.register([AttrPatch(id="t.undo", target="fake_undo:value", replace=lambda old: 99)])
+    engine.register(
+        [AttrPatch(id="t.undo", target="fake_undo:value", replace=lambda old: 99)]
+    )
     engine.install()
     assert module.value == 99
 
@@ -110,7 +118,9 @@ def test_uninstall_restores_original(engine, stub_module):
 
 def test_reapply_after_patch_is_idempotent(engine, stub_module):
     module = stub_module("fake_idem", value=1)
-    engine.register([AttrPatch(id="t.idem", target="fake_idem:value", replace=lambda old: 5)])
+    engine.register(
+        [AttrPatch(id="t.idem", target="fake_idem:value", replace=lambda old: 5)]
+    )
     engine.install()
     engine.install()
     engine._apply_for_module("fake_idem", module, trigger="test")
@@ -122,7 +132,9 @@ def test_reload_reapplies_the_patch(engine, fake_package):
     name = fake_package("fake_reload", "value = 1\n")
     module = importlib.import_module(name)
 
-    engine.register([AttrPatch(id="t.reload", target=f"{name}:value", replace=lambda old: 7)])
+    engine.register(
+        [AttrPatch(id="t.reload", target=f"{name}:value", replace=lambda old: 7)]
+    )
     engine.install()
     assert module.value == 7
 
@@ -164,13 +176,19 @@ def test_missing_target_raises_with_context(engine, stub_module):
         engine.install()
 
     assert "t.missing" in str(info.value)
-    # v2.0 error message quotes the canonical 'module:attr' target form.
+    # error message quotes the canonical 'module:attr' target form.
     assert "fake_missing:absent" in str(info.value)
 
 
 def test_absent_module_stays_pending_until_import_attempt(engine):
     engine.register(
-        [AttrPatch(id="t.absent", target="definitely_not_installed_xyz:value", replace=lambda o: 1)]
+        [
+            AttrPatch(
+                id="t.absent",
+                target="definitely_not_installed_xyz:value",
+                replace=lambda o: 1,
+            )
+        ]
     )
     engine.install()
     assert not engine.is_applied("t.absent")
@@ -182,7 +200,11 @@ def test_absent_module_stays_pending_until_import_attempt(engine):
 def test_declining_patch_is_skipped(engine, stub_module):
     module = stub_module("fake_decline", value=1)
     engine.register(
-        [AttrPatch(id="t.decline", target="fake_decline:value", replace=lambda old: None)]
+        [
+            AttrPatch(
+                id="t.decline", target="fake_decline:value", replace=lambda old: None
+            )
+        ]
     )
     engine.install()
 
@@ -232,11 +254,13 @@ def test_hook_patch_runs_before_trigger_is_imported(engine, fake_package):
 
 
 def test_find_spec_query_does_not_run_hooks(engine, fake_package):
-    """v2.0 §5.2: find_spec only *locates and wraps*; an external existence
-    query must never fire a hook (the old engine ran hooks inside find_spec)."""
+    """find_spec only *locates and wraps*; an external existence
+    query must never fire a hook (including speculative find_spec calls)."""
     name = fake_package("spec_query_target", "value = 1\n")
     calls = []
-    engine.register([HookPatch(id="t.query", trigger=name, run=lambda: calls.append(1))])
+    engine.register(
+        [HookPatch(id="t.query", trigger=name, run=lambda: calls.append(1))]
+    )
     engine.install()
 
     spec = importlib.util.find_spec(name)
@@ -249,10 +273,12 @@ def test_find_spec_query_does_not_run_hooks(engine, fake_package):
 
 
 def test_hook_on_already_imported_module_is_phase_missed(engine, stub_module):
-    """v2.0 §7.3: hooks whose boundary was missed are never re-run late."""
+    """hooks whose boundary was missed are never re-run late."""
     stub_module("already_loaded")
     calls = []
-    engine.register([HookPatch(id="t.late", trigger="already_loaded", run=lambda: calls.append(1))])
+    engine.register(
+        [HookPatch(id="t.late", trigger="already_loaded", run=lambda: calls.append(1))]
+    )
     engine.install()
 
     record = engine.report()["patches"][0]
@@ -261,8 +287,10 @@ def test_hook_on_already_imported_module_is_phase_missed(engine, stub_module):
     assert record["detail"].startswith("phase_missed:")
 
 
-def test_hook_on_namespace_package_is_failed(engine, tmp_path, monkeypatch, tracked_modules):
-    """v2.0 §5.2: a namespace package has no execution body -- it is not a
+def test_hook_on_namespace_package_is_failed(
+    engine, tmp_path, monkeypatch, tracked_modules
+):
+    """a namespace package has no execution body -- it is not a
     valid hook boundary and the hook is marked failed."""
     ns_root = tmp_path / "nsroot"
     (ns_root / "ns_pkg").mkdir(parents=True)  # no __init__.py -> namespace package
@@ -303,7 +331,7 @@ def test_only_whitelist_overrides_disable(engine, stub_module, monkeypatch):
             AttrPatch(id="not.this", target="fake_only:b", replace=lambda old: 2),
         ]
     )
-    # Old-project priority rule (restored in v2.0): a non-empty ONLY is a
+    # A non-empty ONLY is a
     # whitelist and DISABLE is ignored entirely -- even when it names the
     # same id.
     monkeypatch.setenv("TRAINING_MUSA_ADAPTOR_ONLY", "want.this")
@@ -352,7 +380,9 @@ def test_pending_modules_only_lists_unresolved(engine, fake_package):
     engine.register(
         [
             AttrPatch(id="t.pending", target=f"{name}:value", replace=lambda old: 2),
-            AttrPatch(id="t.other", target="never_imported_xyz:value", replace=lambda old: 2),
+            AttrPatch(
+                id="t.other", target="never_imported_xyz:value", replace=lambda old: 2
+            ),
         ]
     )
     engine.install()
@@ -365,18 +395,20 @@ def test_pending_modules_only_lists_unresolved(engine, fake_package):
 def test_multiple_engines_do_not_recurse_on_lookup(engine, fake_package):
     """A private Engine next to another one must not deadlock the import system.
 
-    Regression test (ported): the old engine's ``find_spec`` skipped only its
-    *own* watcher, so two engines watching the same module recursed until the
-    recursion limit killed the process.  v2.0's ``find_spec_without_watchers``
-    skips every known watcher, and the query itself runs no hooks.
+    ``find_spec_without_watchers`` skips every known watcher to prevent
+    recursion between engines. The query itself runs no hooks.
     """
     name = fake_package("recurse_target", "value = 1\n")
     calls = []
     package_engine = Engine()  # a second watcher, like the process-wide ENGINE
     try:
-        package_engine.register([HookPatch(id="t.package", trigger=name, run=lambda: calls.append(1))])
+        package_engine.register(
+            [HookPatch(id="t.package", trigger=name, run=lambda: calls.append(1))]
+        )
         package_engine.install()
-        engine.register([HookPatch(id="t.private", trigger=name, run=lambda: calls.append(2))])
+        engine.register(
+            [HookPatch(id="t.private", trigger=name, run=lambda: calls.append(2))]
+        )
         engine.install()
 
         # Any find_spec for the watched module used to raise RecursionError.
@@ -391,7 +423,9 @@ def test_rebind_only_touches_identity_matches(engine, stub_module, fake_package)
     """A same-named but different object must not be clobbered."""
     target = fake_package("fake_identity", "value = 1\n")
     other = fake_package("fake_other", "value = 'unrelated'\n")
-    engine.register([AttrPatch(id="t.identity", target=f"{target}:value", replace=lambda old: 2)])
+    engine.register(
+        [AttrPatch(id="t.identity", target=f"{target}:value", replace=lambda old: 2)]
+    )
     engine.install()
 
     assert importlib.import_module(other).value == "unrelated"
@@ -403,25 +437,29 @@ def test_malformed_target_is_rejected():
 
 
 def test_unknown_env_ids_are_config_error(engine, stub_module, monkeypatch):
-    """v2.0 §7.1: unknown patch ids in ONLY/DISABLE are a hard ConfigError
-    (the old engine warned and skipped the rest)."""
+    """Unknown patch ids in ONLY/DISABLE are a hard ConfigError."""
     monkeypatch.setenv("TRAINING_MUSA_ADAPTOR_ONLY", "does-not-exist")
     stub_module("unknown_ids", value=1)
     engine.register(
-        [AttrPatch(id="t.known", target="unknown_ids:value", replace=lambda old: old + 1)]
+        [
+            AttrPatch(
+                id="t.known", target="unknown_ids:value", replace=lambda old: old + 1
+            )
+        ]
     )
     with pytest.raises(ConfigError, match="unknown patch id"):
         engine.install()
 
 
 def test_target_must_use_colon_form(engine, stub_module):
-    """v2.0: split_target requires 'module:attr'; the old accepted dot form
-    ('dot_form.value') is rejected."""
+    """Targets require module:attr; an ambiguous dotted form is rejected."""
     with pytest.raises(ValueError):
         AttrPatch(id="t.dot", target="dot_form.value", replace=lambda old: old + 1)
 
     module = stub_module("dot_form", value=1)
-    patch = AttrPatch(id="t.colon", target="dot_form:value", replace=lambda old: old + 1)
+    patch = AttrPatch(
+        id="t.colon", target="dot_form:value", replace=lambda old: old + 1
+    )
     assert patch.module_name == "dot_form" and patch.attr_name == "value"
     engine.register([patch])
     engine.install()
@@ -429,7 +467,7 @@ def test_target_must_use_colon_form(engine, stub_module):
 
 
 def test_apply_requires_explicit_known_ids(engine):
-    """v2.0 §7.3: apply() never mass-imports; ids are required and validated."""
+    """apply() never mass-imports; ids are required and validated."""
     with pytest.raises(ValueError, match="requires explicit patch_ids"):
         engine.apply(())
     with pytest.raises(ConfigError, match="unknown patch id"):
@@ -441,7 +479,7 @@ def test_apply_requires_explicit_known_ids(engine):
     ["__megatron_musa_patch_import_watcher__", "__musa_adapter_import_watcher__"],
 )
 def test_install_refuses_marked_legacy_finder(engine, monkeypatch, marker):
-    """v2.0 §9.3: installing next to a known legacy import watcher is refused."""
+    """installing next to a known legacy import watcher is refused."""
     finder = type("FakeLegacyFinder", (), {})()
     setattr(finder, marker, True)
     monkeypatch.setattr(sys, "meta_path", [finder] + sys.meta_path)
@@ -453,9 +491,9 @@ def test_install_refuses_marked_legacy_finder(engine, monkeypatch, marker):
 
 @pytest.mark.parametrize("module_name", ["megatron_musa_patch", "musa_adapter"])
 def test_install_refuses_legacy_module(engine, stub_module, module_name):
-    """v2.0 §9.3: an already-imported legacy patch package is refused too."""
-    stub_module(module_name)  # pretend the legacy package is imported
-    with pytest.raises(EngineOverlapError, match="already imported"):
+    """An already-active external patch package is refused too."""
+    stub_module(module_name, is_applied=lambda: True)
+    with pytest.raises(EngineOverlapError, match="active patches"):
         engine.install()
     assert engine._watcher not in sys.meta_path
 
@@ -467,7 +505,9 @@ def gate_metadata(monkeypatch):
     monkeypatch.setattr(_compat, "distribution_version", lambda name: "5.16.1")
 
 
-def test_version_gate_skips_attr_patch_via_engine(engine, monkeypatch, stub_module, gate_metadata):
+def test_version_gate_skips_attr_patch_via_engine(
+    engine, monkeypatch, stub_module, gate_metadata
+):
     """A blocked declarative gate skips the patch with the reason recorded."""
 
     original = object()
@@ -491,7 +531,9 @@ def test_version_gate_skips_attr_patch_via_engine(engine, monkeypatch, stub_modu
     assert module.thing is original
 
 
-def test_version_gate_applies_within_range(engine, monkeypatch, stub_module, gate_metadata):
+def test_version_gate_applies_within_range(
+    engine, monkeypatch, stub_module, gate_metadata
+):
     module = stub_module("fake.mod2", thing=object())
     engine.register(
         [
@@ -513,7 +555,7 @@ def test_version_gate_applies_within_range(engine, monkeypatch, stub_module, gat
 def test_version_gate_skips_hook_via_engine(engine, fake_package, gate_metadata):
     """Hooks honour declarative gates too, recorded as skipped.
 
-    Ported with a not-yet-imported trigger: v2.0 hooks only run at the real
+    Ported with a not-yet-imported trigger: hooks only run at the real
     exec boundary, and a hook on an already-loaded module is phase_missed --
     it would never reach the gate check.
     """
@@ -548,9 +590,15 @@ def test_version_gate_malformed_spec_rejected():
         )
     with pytest.raises(ValueError):
         AttrPatch(
-            id="x", target="fake.m:attr", replace=lambda c: c, version_gates=("transformer_engine",)
+            id="x",
+            target="fake.m:attr",
+            replace=lambda c: c,
+            version_gates=("transformer_engine",),
         )
     with pytest.raises(ValueError):
         HookPatch(
-            id="y", trigger="fake.m", run=lambda: None, version_gates=("transformer_engine <abc",)
+            id="y",
+            trigger="fake.m",
+            run=lambda: None,
+            version_gates=("transformer_engine <abc",),
         )

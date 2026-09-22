@@ -22,7 +22,10 @@ def test_te_version_predicate_is_not_overridden(engine, stub_module):
     assert module.is_te_min_version is original
     assert module.is_te_min_version("999.0.0") is False
     original.assert_called_once_with("999.0.0")
-    assert all(r["id"] != "megatron.core.utils.te-version-check.ignore" for r in engine.report()["patches"])
+    assert all(
+        r["id"] != "megatron.core.utils.te-version-check.ignore"
+        for r in engine.report()["patches"]
+    )
 
 
 def test_mem_monitor_shim_installs_and_undos(monkeypatch):
@@ -59,13 +62,15 @@ def test_mem_monitor_shim_never_shadows_an_existing_musa_patch(monkeypatch):
 def test_mem_monitor_shim_requires_the_musa_fork(monkeypatch):
     import sys
 
-    monkeypatch.setattr(_transformer_engine, "_te_fork_needs_mem_monitor", lambda: False)
+    monkeypatch.setattr(
+        _transformer_engine, "_te_fork_needs_mem_monitor", lambda: False
+    )
     assert _transformer_engine._install_mem_monitor_shim() is False
     assert "musa_patch" not in sys.modules
 
 
 def test_mem_monitor_shim_installs_through_engine(engine, tmp_path, monkeypatch):
-    """v2.0: hooks fire at the trigger's real exec boundary, not at install."""
+    """hooks fire at the trigger's real exec boundary, not at install."""
     monkeypatch.setattr(_transformer_engine, "_te_fork_needs_mem_monitor", lambda: True)
     import sys
 
@@ -77,13 +82,15 @@ def test_mem_monitor_shim_installs_through_engine(engine, tmp_path, monkeypatch)
     (pkg / "parallel_state.py").write_text("X = 1\n")
     monkeypatch.syspath_prepend(str(tmp_path))
     patch = next(
-        p for p in _transformer_engine.PATCHES
+        p
+        for p in _transformer_engine.PATCHES
         if p.id == "megatron.te.grouped-linear.mem-monitor-compat"
     )
     engine.register([patch])
     try:
         engine.install()
         import megatron.core.parallel_state  # noqa: F401 - fires the boundary
+
         statuses = {r["id"]: r["status"] for r in engine.report()["patches"]}
         assert statuses["megatron.te.grouped-linear.mem-monitor-compat"] == "applied"
         assert "musa_patch.mem_utils" in sys.modules
@@ -108,9 +115,17 @@ class TeFork:
 
         elif arity == 5:
 
-            def target(enabled, num_layers, model_layers, offload_activations, offload_weights):
+            def target(
+                enabled, num_layers, model_layers, offload_activations, offload_weights
+            ):
                 self.calls.append(
-                    (enabled, num_layers, model_layers, offload_activations, offload_weights)
+                    (
+                        enabled,
+                        num_layers,
+                        model_layers,
+                        offload_activations,
+                        offload_weights,
+                    )
                 )
                 return "five"
 
@@ -248,7 +263,9 @@ def test_quantized_init_context_and_ownership(monkeypatch):
     active = []
 
     @contextmanager
-    def fp8_model_init(enabled=True, recipe=None, preserve_high_precision_init_val=False):
+    def fp8_model_init(
+        enabled=True, recipe=None, preserve_high_precision_init_val=False
+    ):
         active.append((enabled, recipe, preserve_high_precision_init_val))
         try:
             yield
@@ -269,7 +286,9 @@ def test_quantized_init_context_and_ownership(monkeypatch):
         assert _transformer_engine._install_quantized_model_init()
         assert not _transformer_engine._install_quantized_model_init()
         recipe = DelayedScaling()
-        with module.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        with module.quantized_model_init(
+            recipe=recipe, preserve_high_precision_init_val=True
+        ):
             assert active == [(True, recipe, True)]
             with pytest.raises(RuntimeError, match="body failed"):
                 with module.quantized_model_init(False):
@@ -450,7 +469,9 @@ def test_jit_compile_keeps_eager_factory_binding(monkeypatch):
     ],
 )
 def test_early_te_hooks_decline_non_musa_fork(monkeypatch, install):
-    monkeypatch.setattr(_transformer_engine, "_te_fork_needs_mem_monitor", lambda: False)
+    monkeypatch.setattr(
+        _transformer_engine, "_te_fork_needs_mem_monitor", lambda: False
+    )
     try:
         assert install() is False
     finally:

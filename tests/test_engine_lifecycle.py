@@ -1,11 +1,8 @@
-# 来源: megatron-musa-patch/tests/test_engine_lifecycle.py
-# 主要适配点: apply_now() 不存在——attr 目标用 install()+import(或 apply([id]))
-# 驱动; Hook 触发模块一律改为未导入的 fake package(已加载模块的 Hook 在 v2.0 标
-# phase_missed,不会 late-run); 别名修复显式传 rebind_prefixes=("megatron",)(v2.0
-# 默认空); 配置每 Engine 冻结一次,改变选择的用例改用新 Engine 实例;
-# 旧"失败版本检查重试"改为冻结失败重试(引擎不再有框架版本检查);
-# 旧"多引擎各自应用全部 Hook/属性"按 v2.0 观测语义重写: watcher 互不委托,
-# 同一触发模块由最后安装的 watcher 接管边界.
+# 要点: attr 目标用 install()+import(或 apply([id])) 驱动; Hook 触发模块为
+# 未导入的 fake package(已加载模块的 Hook 标 phase_missed,不会 late-run);
+# 别名修复显式传 rebind_prefixes; 配置每 Engine 冻结一次,改变选择的用例用
+# 新 Engine 实例; 清理未完成时禁止重装; 多 watcher 时同一触发模块由
+# 匹配的引擎按安装顺序共同处理执行边界.
 """Regression coverage for composition, ownership and failure diagnostics."""
 
 from __future__ import annotations
@@ -100,9 +97,7 @@ def test_missing_attribute_is_recorded_failed(engine, stub_module):
 
 
 def test_failed_freeze_can_be_retried(engine, monkeypatch):
-    """Ported from the old failed-version-check retry test.  v2.0 has no
-    framework version check; the equivalent install-time failure is the
-    configuration freeze, and a failed freeze must not brick the engine."""
+    """A failed configuration freeze must remain retryable."""
     state = {"fail": True}
     real_freeze = engine.config.freeze
 
@@ -121,7 +116,9 @@ def test_failed_freeze_can_be_retried(engine, monkeypatch):
 
 
 def test_optional_target_and_broken_dependency_are_distinct(engine, fake_package):
-    name = fake_package("broken_dependency", "import missing_dependency_xyz\nvalue = 1\n")
+    name = fake_package(
+        "broken_dependency", "import missing_dependency_xyz\nvalue = 1\n"
+    )
     engine.register([AttrPatch("broken", f"{name}:value", lambda old: 2)])
     with pytest.raises(ModuleNotFoundError, match="missing_dependency_xyz"):
         engine.apply(["broken"])
@@ -136,7 +133,9 @@ def test_internal_import_error_is_not_swallowed(engine, fake_package):
 
 
 def test_missing_parent_is_optional(engine):
-    engine.register([AttrPatch("optional", "missing_parent_xyz.child:value", lambda old: 2)])
+    engine.register(
+        [AttrPatch("optional", "missing_parent_xyz.child:value", lambda old: 2)]
+    )
     engine.apply(["optional"])
     assert engine.report()["patches"][0]["status"] == "skipped"
 
@@ -150,12 +149,14 @@ def test_uninstall_clears_pending_and_filter_state(engine, stub_module, monkeypa
     assert module.value == 1
     assert engine.pending_modules() == []
 
-    # v2.0: configuration freezes once per Engine, so a changed selection is
+    # configuration freezes once per Engine, so a changed selection is
     # observed through a fresh engine (the old test cycled one engine).
     monkeypatch.setenv("TRAINING_MUSA_ADAPTOR_DISABLE", "filter")
     second = Engine()
     try:
-        second.register([AttrPatch("filter", "filter_cycle:value", lambda old: old + 1)])
+        second.register(
+            [AttrPatch("filter", "filter_cycle:value", lambda old: old + 1)]
+        )
         second.install()
         assert module.value == 1
         assert second.report()["patches"][0]["status"] == "skipped"
@@ -198,7 +199,11 @@ def test_reversible_and_irreversible_hooks(engine, fake_package):
     )
     engine.install()
     importlib.import_module(name)
-    assert [r["status"] for r in engine.report()["patches"]] == ["applied", "applied", "skipped"]
+    assert [r["status"] for r in engine.report()["patches"]] == [
+        "applied",
+        "applied",
+        "skipped",
+    ]
     engine.uninstall()
     assert calls == ["run", "once", "undo"]
     # A hook without undo is one-shot: reported applied, restart-required.
@@ -265,7 +270,7 @@ def test_failed_hook_undo_blocks_reinstall_until_unapply_succeeds(engine, fake_p
     assert state["undone"]
     assert not engine.is_applied("undo-fail")
     # Reinstall is allowed again; the already-imported trigger is phase_missed
-    # (v2.0 never re-runs a missed hook late).
+    # (never re-runs a missed hook late).
     engine.install()
     record = engine.report()["patches"][0]
     assert record["status"] == "skipped"
@@ -289,7 +294,11 @@ def test_descriptors_and_inherited_attributes_restore_exactly(engine, stub_modul
     stub_module("descriptor_target", Parent=Parent, Child=Child)
     engine.register(
         [
-            AttrPatch("static", "descriptor_target:Child.static", lambda old: lambda v: old(v) + 1),
+            AttrPatch(
+                "static",
+                "descriptor_target:Child.static",
+                lambda old: lambda v: old(v) + 1,
+            ),
             AttrPatch(
                 "class",
                 "descriptor_target:Parent.class_method",
@@ -313,9 +322,10 @@ def test_alias_repair_is_bounded_and_never_rebinds_flags(engine, stub_module):
     outside = stub_module("outside_alias", fn=original, flag=True)
     engine.register(
         [
-            # v2.0: the old engine repaired megatron.* aliases by default;
-            # the scope is now an explicit per-patch declaration.
-            AttrPatch("alias", "alias_target:fn", _wrap("1"), rebind_prefixes=("megatron",)),
+            # Alias repair requires an explicit per-patch scope.
+            AttrPatch(
+                "alias", "alias_target:fn", _wrap("1"), rebind_prefixes=("megatron",)
+            ),
             AttrPatch("flag", "alias_target:flag", lambda old: False),
         ]
     )
@@ -356,12 +366,7 @@ def test_multiple_engines_patch_disjoint_modules(engine, fake_package):
 
 
 def test_multiple_engines_contested_boundary(engine, fake_package):
-    """v2.0 watcher semantics on one contested trigger: watchers never
-    delegate through each other, so the last-installed watcher wraps the
-    loader (the old engine chained find_spec so both engines fired).
-
-    Ported from test_multiple_engines_apply_all_hooks_and_attributes.
-    """
+    """One loader runs every matching engine's hooks in installation order."""
     name = fake_package("multiple_engines", "value = 1\n")
     calls = []
     other = Engine()
@@ -376,16 +381,16 @@ def test_multiple_engines_contested_boundary(engine, fake_package):
         engine.install()
         other.install()
         module = importlib.import_module(name)
-        assert calls == [2]  # the last-installed watcher owns this boundary
+        assert calls == [1, 2]
         assert module.value == 42
-        assert not engine.is_applied("first")
-        assert engine.pending_modules() == [name]
+        assert engine.is_applied("first")
+        assert engine.pending_modules() == []
     finally:
         other.uninstall()
     # With the later engine gone, a fresh import hits the first engine.
     sys.modules.pop(name)
     module = importlib.import_module(name)
-    assert calls == [2, 1]
+    assert calls == [1, 2]  # irreversible hooks are not run twice
     assert module.value == 1
 
 
@@ -405,7 +410,11 @@ def test_alias_commit_failure_restores_target_and_existing_aliases(
     module = stub_module("atomic_alias", fn=original)
     alias = stub_module("megatron.atomic_alias", fn=original)
     engine.register(
-        [AttrPatch("first", "atomic_alias:fn", _wrap("1"), rebind_prefixes=("megatron",))]
+        [
+            AttrPatch(
+                "first", "atomic_alias:fn", _wrap("1"), rebind_prefixes=("megatron",)
+            )
+        ]
     )
     if rebuild:
         engine.install()
@@ -419,7 +428,14 @@ def test_alias_commit_failure_restores_target_and_existing_aliases(
         with pytest.raises(TrainingMusaAdaptorError, match="alias commit failed"):
             if rebuild:
                 engine.register(
-                    [AttrPatch("second", "atomic_alias:fn", _wrap("2"), rebind_prefixes=("megatron",))]
+                    [
+                        AttrPatch(
+                            "second",
+                            "atomic_alias:fn",
+                            _wrap("2"),
+                            rebind_prefixes=("megatron",),
+                        )
+                    ]
                 )
             else:
                 engine.install()
@@ -430,7 +446,9 @@ def test_alias_commit_failure_restores_target_and_existing_aliases(
     assert alias.fn is original
 
 
-def test_failed_attribute_undo_is_retryable_and_does_not_block_other_cleanup(engine, stub_module):
+def test_failed_attribute_undo_is_retryable_and_does_not_block_other_cleanup(
+    engine, stub_module
+):
     class Target:
         fail = False
 
@@ -463,7 +481,9 @@ def test_failed_attribute_undo_is_retryable_and_does_not_block_other_cleanup(eng
     assert target.value == 1
 
 
-def test_reload_retires_declined_patch_and_repairs_old_consumers(engine, fake_package, stub_module):
+def test_reload_retires_declined_patch_and_repairs_old_consumers(
+    engine, fake_package, stub_module
+):
     state = {"needed": True}
     name = fake_package("conditional_reload", "def fn(): return 'upstream'\n")
     engine.register(
@@ -503,10 +523,77 @@ def test_late_aliases_follow_rebuilt_chain(engine, fake_package, stub_module, ac
         importlib.reload(module)
     else:
         engine.register(
-            [AttrPatch("second", f"{name}:fn", _wrap("2"), rebind_prefixes=("megatron",))]
+            [
+                AttrPatch(
+                    "second", f"{name}:fn", _wrap("2"), rebind_prefixes=("megatron",)
+                )
+            ]
         )
     assert late.fn is module.fn
     assert foreign.fn() == "foreign"
     engine.uninstall()
     assert late.fn is module.fn
     assert late.fn() == "base"
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_late_registration_retires_a_declined_owned_chain(
+    engine, stub_module, inherited
+):
+    original = lambda: "base"
+    state = {"needed": True}
+    if inherited:
+        base = type("Base", (), {"fn": staticmethod(original)})
+        owner = type("Child", (base,), {})
+        module = stub_module("retired_chain", Child=owner)
+        target = "retired_chain:Child.fn"
+    else:
+        owner = module = stub_module("retired_chain", fn=original)
+        target = "retired_chain:fn"
+    alias = stub_module("retired_consumer", fn=original)
+    engine.register(
+        [
+            AttrPatch(
+                "first",
+                target,
+                lambda old: _wrap("1")(old) if state["needed"] else None,
+                rebind_prefixes=("retired_consumer",),
+            )
+        ]
+    )
+    engine.install()
+    assert owner.fn() == "base1"
+    state["needed"] = False
+    engine.register([AttrPatch("second", target, lambda old: None)])
+    assert owner.fn is original
+    assert alias.fn is original
+    if inherited:
+        assert "fn" not in vars(module.Child)
+    assert not engine._bindings
+    assert not engine.is_applied()
+    engine.uninstall()
+    assert owner.fn is original
+
+
+def test_debug_uses_frozen_configuration(engine, fake_package, monkeypatch):
+    name = fake_package("frozen_debug", "value = 1")
+    engine.register([AttrPatch("debug", f"{name}:value", lambda old: 2)])
+    engine.install()
+    monkeypatch.setenv("TRAINING_MUSA_ADAPTOR_DEBUG", "invalid-after-freeze")
+    module = importlib.import_module(name)
+    assert module.value == 2
+    assert engine.is_applied("debug")
+    assert engine.report()["config"]["debug"] is False
+    engine.uninstall()
+    assert module.value == 1
+
+
+def test_invalid_late_gate_does_not_commit_suite_registry(engine):
+    engine.install()
+    patch = AttrPatch(
+        "bad", "late_gate:value", lambda old: 2, version_gates=("some-package >=1..2",)
+    )
+    with pytest.raises(ValueError):
+        engine.register([patch], patch_suites={"bad": "late"})
+    assert engine.report()["patches"] == []
+    assert engine._patch_suites == {}

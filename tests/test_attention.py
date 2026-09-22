@@ -7,9 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
+# torch-free at import time (stubs only): bind the module before the skip gate
 from training_musa_adaptor.patches.megatron import attention as attn
+
+torch = pytest.importorskip("torch")
 
 
 def _module(**overrides):
@@ -49,8 +50,13 @@ class TestEligibility:
 
     @pytest.mark.parametrize(
         "flag",
-        ["fp8_dot_product_attention", "fp8_multi_head_attention", "qk_clip",
-         "log_max_attention_logit", "apply_query_key_layer_scaling"],
+        [
+            "fp8_dot_product_attention",
+            "fp8_multi_head_attention",
+            "qk_clip",
+            "log_max_attention_logit",
+            "apply_query_key_layer_scaling",
+        ],
     )
     def test_config_protocol_flags_rejected(self, flag):
         module = _module()
@@ -67,13 +73,21 @@ class TestEligibility:
     def test_num_splits_rejected(self):
         q, k, v = _qkv()
         assert not attn._eligible(_module(), q, k, v, None, 2, "causal", None)
-        assert not attn._eligible(_module(num_splits=2), q, k, v, None, None, "causal", None)
+        assert not attn._eligible(
+            _module(num_splits=2), q, k, v, None, None, "causal", None
+        )
 
     def test_window_restrictions(self):
         q, k, v = _qkv()
-        assert attn._eligible(_module(window_size=(-1, -1)), q, k, v, None, None, "causal", None)
-        assert attn._eligible(_module(window_size=(-1, 0)), q, k, v, None, None, "causal", None)
-        assert not attn._eligible(_module(window_size=(16, 0)), q, k, v, None, None, "causal", None)
+        assert attn._eligible(
+            _module(window_size=(-1, -1)), q, k, v, None, None, "causal", None
+        )
+        assert attn._eligible(
+            _module(window_size=(-1, 0)), q, k, v, None, None, "causal", None
+        )
+        assert not attn._eligible(
+            _module(window_size=(16, 0)), q, k, v, None, None, "causal", None
+        )
         # (-1, 0) with a non-causal mask is contradictory -> upstream
         assert not attn._eligible(
             _module(window_size=(-1, 0)), q, k, v, None, None, "no_mask", None
@@ -82,7 +96,9 @@ class TestEligibility:
     def test_cp_rejected(self):
         group = SimpleNamespace(size=lambda: 2)
         q, k, v = _qkv()
-        assert not attn._eligible(_module(cp_group=group), q, k, v, None, None, "causal", None)
+        assert not attn._eligible(
+            _module(cp_group=group), q, k, v, None, None, "causal", None
+        )
         module = _module()
         module.config.context_parallel_size = 2
         assert not attn._eligible(module, q, k, v, None, None, "causal", None)
@@ -101,7 +117,7 @@ class TestEligibility:
 
 class TestBuildMeta:
     def test_te_causal_window_normalized(self):
-        """Regression (round 1): TE normalizes causal modules to (-1, 0);
+        """Regression: TE normalizes causal modules to (-1, 0);
         the encoding must not reach implementations."""
         q, k, v = _qkv()
         meta = attn._build_meta(
@@ -120,20 +136,31 @@ class TestBuildMeta:
     def test_may_require_backward_from_training(self):
         q, k, v = _qkv()
         with torch.no_grad():
-            meta = attn._build_meta(_module(training=True), q, k, v, None, None, None, "causal", "sbhd")
+            meta = attn._build_meta(
+                _module(training=True), q, k, v, None, None, None, "causal", "sbhd"
+            )
             assert meta.may_require_backward is True
-            meta = attn._build_meta(_module(training=False), q, k, v, None, None, None, "causal", "sbhd")
+            meta = attn._build_meta(
+                _module(training=False), q, k, v, None, None, None, "causal", "sbhd"
+            )
             assert meta.may_require_backward is False
 
     def test_may_require_backward_from_grad_inputs(self):
         q, k, v = _qkv()
         q.requires_grad_(True)
-        meta = attn._build_meta(_module(training=False), q, k, v, None, None, None, "causal", "sbhd")
+        meta = attn._build_meta(
+            _module(training=False), q, k, v, None, None, None, "causal", "sbhd"
+        )
         assert meta.may_require_backward is True
 
     def test_effective_dropout(self):
-        assert attn._effective_dropout(_module(training=True, attention_dropout=0.2)) == pytest.approx(0.2)
-        assert attn._effective_dropout(_module(training=False, attention_dropout=0.2)) == 0.0
+        assert attn._effective_dropout(
+            _module(training=True, attention_dropout=0.2)
+        ) == pytest.approx(0.2)
+        assert (
+            attn._effective_dropout(_module(training=False, attention_dropout=0.2))
+            == 0.0
+        )
 
     def test_shape_fields(self):
         q, k, v = _qkv(head_dim=192, v_dim=128)
@@ -148,7 +175,9 @@ class TestPackedSpans:
         return torch.tensor(values, dtype=torch.int32)
 
     def test_valid_spans(self):
-        spans = attn._packed_spans(self._cu([0, 128, 128, 224]), self._cu([0, 192, 256, 384]), 384)
+        spans = attn._packed_spans(
+            self._cu([0, 128, 128, 224]), self._cu([0, 192, 256, 384]), 384
+        )
         assert spans == [(0, 128, 192), (192, 0, 64), (256, 96, 128)]
 
     def test_valid_without_padding(self):
@@ -172,9 +201,8 @@ class TestFactoryDecline:
         assert attn._tedpa_forward(lambda self, *a, **k: None) is None
 
     def test_factory_wraps_with_marker(self, monkeypatch):
-        monkeypatch.setattr(
-            attn, "module_source_contains", lambda module, needle: True
-        )
+        monkeypatch.setattr(attn, "module_source_contains", lambda module, needle: True)
+
         def original(self, *a, **k):
             return "original"
 
@@ -183,4 +211,39 @@ class TestFactoryDecline:
         module = _module()
         # CPU tensor: non-MUSA calls keep the original path
         q, k, v = _qkv()
-        assert wrapper(module, q, k, v, None, SimpleNamespace(name="causal")) == "original"
+        assert (
+            wrapper(module, q, k, v, None, SimpleNamespace(name="causal")) == "original"
+        )
+
+
+def test_non_musa_forward_does_not_probe_adaptation(monkeypatch):
+    from unittest.mock import Mock
+
+    original = Mock(return_value="upstream")
+    monkeypatch.setattr(attn, "module_source_contains", lambda *args: True)
+    monkeypatch.setattr(attn, "_eligible", lambda *args: pytest.fail("must not probe"))
+    query = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    module, key, value, mask, bias, packed = (object() for _ in range(6))
+    forward = attn._tedpa_forward(original)
+    assert (
+        forward(module, query, key, value, mask, "causal", bias, packed, 2)
+        == "upstream"
+    )
+    original.assert_called_once_with(
+        module,
+        query,
+        key,
+        value,
+        mask,
+        "causal",
+        attention_bias=bias,
+        packed_seq_params=packed,
+        num_splits=2,
+    )
+
+
+def test_list_causal_window_rejects_noncausal_mask():
+    q, k, v = _qkv()
+    assert not attn._eligible(
+        _module(window_size=[-1, 0]), q, k, v, None, None, "no_mask", None
+    )

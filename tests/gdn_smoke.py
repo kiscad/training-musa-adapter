@@ -28,7 +28,9 @@ from torch_kernels.attention import gated_delta_net as tk_gdn  # noqa: E402
 
 statuses = {record["id"]: record["status"] for record in tma.report()["patches"]}
 assert statuses["megatron.ssm.gated-delta-rule.tilelang"] == "applied", statuses
-assert getattr(core_gdn.chunk_gated_delta_rule, "_training_musa_adaptor_tk_gdn", False), statuses
+assert getattr(
+    core_gdn.chunk_gated_delta_rule, "_training_musa_adaptor_tk_gdn", False
+), statuses
 print("SSM_PASS core-binding")
 
 DEV = "musa"
@@ -37,13 +39,44 @@ DEV = "musa"
 def model_shaped(batch, seq, heads, key_dim=128, value_dim=128, seed=0):
     """Megatron's exact pre-kernel inputs: l2-normalized q/k, fp32 decay."""
     generator = torch.Generator(device=DEV).manual_seed(seed)
-    q = torch.randn(batch, seq, heads, key_dim, generator=generator, device=DEV, dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, key_dim, generator=generator, device=DEV, dtype=torch.bfloat16)
+    q = torch.randn(
+        batch,
+        seq,
+        heads,
+        key_dim,
+        generator=generator,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        batch,
+        seq,
+        heads,
+        key_dim,
+        generator=generator,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
     q = fla.modules.l2norm.l2norm(q.contiguous()).contiguous()
     k = fla.modules.l2norm.l2norm(k.contiguous()).contiguous()
-    v = torch.randn(batch, seq, heads, value_dim, generator=generator, device=DEV, dtype=torch.bfloat16)
-    g = -torch.rand(batch, seq, heads, generator=generator, device=DEV, dtype=torch.float32) * 2.0
-    beta = torch.rand(batch, seq, heads, generator=generator, device=DEV, dtype=torch.bfloat16)
+    v = torch.randn(
+        batch,
+        seq,
+        heads,
+        value_dim,
+        generator=generator,
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
+    g = (
+        -torch.rand(
+            batch, seq, heads, generator=generator, device=DEV, dtype=torch.float32
+        )
+        * 2.0
+    )
+    beta = torch.rand(
+        batch, seq, heads, generator=generator, device=DEV, dtype=torch.bfloat16
+    )
     return q, k, v, g, beta
 
 
@@ -69,12 +102,16 @@ bridge_status = statuses.get("mcore_bridge.ssm.gated-delta-rule.tilelang")
 if bridge_status == "applied":
     import mcore_bridge.model.modules.gated_delta_net as bridge_gdn  # noqa: E402
 
-    assert getattr(bridge_gdn.chunk_gated_delta_rule, "_training_musa_adaptor_tk_gdn", False)
+    assert getattr(
+        bridge_gdn.chunk_gated_delta_rule, "_training_musa_adaptor_tk_gdn", False
+    )
     q, k, v, g, beta = model_shaped(1, 512, 8, seed=3)
     with torch.no_grad():
         via_bridge = bridge_gdn.chunk_gated_delta_rule(q, k, v, g=g, beta=beta, **KW)[0]
         direct_tk = tk_gdn(q, k, v, g, beta, backend="tilelang", **KW)[0]
-    assert torch.equal(via_bridge, direct_tk), "the bridge binding must run torch-kernels too"
+    assert torch.equal(
+        via_bridge, direct_tk
+    ), "the bridge binding must run torch-kernels too"
     print("SSM_PASS bridge-binding")
 else:  # pragma: no cover - wheel-only stacks have no mcore-bridge
     print(f"SSM_SKIP bridge-binding (status {bridge_status!r})")
@@ -106,11 +143,15 @@ fla_out = fla_gdn(*leaf, **KW)[0]
 fla_grads = [x.grad for x in leaf]
 
 with torch.no_grad():
-    ref_out = mgdn.torch_chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm_in_kernel=False)[0]
+    ref_out = mgdn.torch_chunk_gated_delta_rule(
+        q, k, v, g, beta, use_qk_l2norm_in_kernel=False
+    )[0]
 
 assert_close("forward-vs-reference", patched_out, ref_out, atol=0.1, rtol=0.05)
 assert_close("forward-vs-fla", patched_out, fla_out, atol=0.1, rtol=0.05)
-for name, got, want in zip(("dq", "dk", "dv", "dg", "dbeta"), patched_grads, fla_grads):
+for name, got, want in zip(
+    ("dq", "dk", "dv", "dg", "dbeta"), patched_grads, fla_grads, strict=True
+):
     assert_close(f"dgrad-{name}-vs-fla", got, want, atol=0.1, rtol=0.05)
 assert all(torch.isfinite(x).all() for x in patched_grads), "gradients must stay finite"
 
@@ -119,7 +160,9 @@ short = model_shaped(1, 64, 8, seed=11)
 with torch.no_grad():
     demoted = through_patched(short, **KW)[0]
     fla_short = fla_gdn(*short, **KW)[0]
-assert torch.equal(demoted, fla_short), "short sequences must fall back to fla bit-identically"
+assert torch.equal(
+    demoted, fla_short
+), "short sequences must fall back to fla bit-identically"
 print("SSM_PASS demotion-short-sequence")
 
 q, k, v, g, beta = model_shaped(1, 512, 8, seed=13)
@@ -127,11 +170,15 @@ with torch.no_grad():
     fla_only = through_patched(
         (q, k, v, g, beta), use_beta_sigmoid_in_kernel=False, **KW
     )[0]
-    fla_same = fla_gdn(q, k, v, g=g, beta=beta, use_beta_sigmoid_in_kernel=False, **KW)[0]
-assert torch.equal(fla_only, fla_same), "fla-only keywords must fall back bit-identically"
+    fla_same = fla_gdn(q, k, v, g=g, beta=beta, use_beta_sigmoid_in_kernel=False, **KW)[
+        0
+    ]
+assert torch.equal(
+    fla_only, fla_same
+), "fla-only keywords must fall back bit-identically"
 print("SSM_PASS demotion-fla-only-keyword")
 
-# DISABLE in a fresh process restores FLA's binding (v2.0 switch semantics).
+# DISABLE in a fresh process restores FLA's binding (switch semantics).
 env = dict(os.environ)
 env["TRAINING_MUSA_ADAPTOR_DISABLE"] = "megatron.ssm.gated-delta-rule.tilelang"
 probe = subprocess.run(

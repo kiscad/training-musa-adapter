@@ -16,7 +16,7 @@ def test_gmm_matches_per_expert_matmul_reference():
     out = _grouped_gemm.gmm(a, b, torch.tensor(counts), trans_b=False)
     assert out.shape == (total, 4)
     start = 0
-    for count, weight in zip(counts, b):
+    for count, weight in zip(counts, b, strict=True):
         expected = a[start : start + count] @ weight
         torch.testing.assert_close(out[start : start + count], expected)
         start += count
@@ -29,7 +29,7 @@ def test_gmm_trans_b():
     out = _grouped_gemm.gmm(a, b, torch.tensor(counts), trans_b=True)
     assert out.shape == (4, 5)
     start = 0
-    for count, weight in zip(counts, b):
+    for count, weight in zip(counts, b, strict=True):
         expected = a[start : start + count] @ weight.transpose(-2, -1)
         torch.testing.assert_close(out[start : start + count], expected)
         start += count

@@ -1,7 +1,6 @@
-# 来源: megatron-musa-patch/tests/conftest.py
-# 主要适配点: 环境隔离覆盖 TRAINING_MUSA_ADAPTOR_* 与旧 MEGATRON_MUSA_PATCH* 前缀;
+# 环境隔离: 覆盖 TRAINING_MUSA_ADAPTOR_* 前缀(含遗留 MEGATRON_MUSA_PATCH_*);
 # 合成 sys.modules 条目集中登记、autouse 清理; 每个测试后就地清理进程级
-# activation.ENGINE(不替换对象); 删除 src/ sys.path 注入(包已 editable 安装).
+# activation.ENGINE(不替换对象).
 """Shared pytest fixtures."""
 
 from __future__ import annotations
@@ -70,11 +69,13 @@ def _clean_process_engine() -> None:
     except Exception:
         pass  # teardown must never mask the test's own failure
     engine._records.clear()
+    engine._patch_suites.clear()
     engine._attrs.clear()
     engine._hooks.clear()
     engine._bindings.clear()
     engine._undo_order.clear()
     engine._running_hooks.clear()
+    engine._failed_mutations.clear()
     engine._restart_required.clear()
     engine._saved_error = None
     engine._installed = False
@@ -152,7 +153,9 @@ def integration_env(extra: dict | None = None) -> dict:
     """Environment for subprocess integration tests: adaptor on, importable."""
     from pathlib import Path
 
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")}
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")
+    }
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
     paths = [str(Path(__file__).resolve().parents[1] / "src")]
     if env.get("MEGATRON_LM_PATH"):

@@ -1,13 +1,8 @@
-# 来源: megatron-musa-patch/tests/test_version_gates.py
-# 主要适配点: 版本比较从"数字 release 补零"改为 packaging SpecifierSet
-# (prereleases=True 显式, 设计 §7.2): rc/dev 参与比较——"2.0rc1 >=2.0" 现在被
-# 拒绝, post/dev 不再等于裸 release; 语法校验跟随 packaging(~=、==2.0rc1 合法,
-# <2.* 非法); IGNORE_VERSION_GATES 开关不存在(相关 4 个用例删除), 旧"覆盖后重装"
-# 用例改为"变更版本元数据 + 新 Engine 重估"; module_source_contains 返回
-# True/False/None(未知), 且 find_spec 导入父包是文档承认的平台行为(旧"不导入父包"
-# 保证改为"不执行目标子模块"); Hook 门控用例改用未导入触发模块(exec 边界语义);
-# 记录一处行为差异: 不可解析的安装版本字符串会从 check_version_gate 抛出
-# InvalidVersion(旧项目跳过异常版本), 见移植报告.
+# 契约要点: 版本比较使用 packaging SpecifierSet (prereleases=True 显式): rc/dev 参与比较——"2.0rc1 >=2.0" 被拒绝, post/dev 不等于裸 release;
+# 语法校验跟随 packaging(~=、==2.0rc1 合法, <2.* 非法); 不存在全局忽略开关;
+# module_source_contains 返回 True/False/None(未知), 源码探针不执行目标子模块;
+# Hook 门控在 exec 边界评估; 不可解析的安装版本字符串从 check_version_gate
+# 抛出 InvalidVersion.
 """Declarative gates must be deterministic and safe before target resolution."""
 
 import importlib
@@ -60,10 +55,7 @@ def test_prerelease_versions_participate_in_comparison(monkeypatch):
 
 @pytest.mark.parametrize("installed", ["unknown", "2..0"])
 def test_unparseable_installed_version_raises_loudly(monkeypatch, installed):
-    """Current v2.0 behavior: packaging's InvalidVersion propagates out of
-    check_version_gate instead of blocking or skipping the gate (the old
-    project skipped malformed version strings).  Recorded as an open engine
-    question -- see the migration report."""
+    """Invalid installed versions propagate instead of silently skipping."""
     monkeypatch.setattr(_compat, "distribution_version", lambda name: installed)
     with pytest.raises(InvalidVersion):
         _compat.check_version_gate("vendor <2.1")
@@ -100,7 +92,10 @@ def test_packaging_gate_syntax_accepted(spec):
 
 
 def test_gate_distribution_names_are_normalized():
-    assert _compat.parse_version_gate("Transformer.Engine >=2.0")[0] == "transformer-engine"
+    assert (
+        _compat.parse_version_gate("Transformer.Engine >=2.0")[0]
+        == "transformer-engine"
+    )
     assert _compat.parse_version_gate("torch_musa <3")[0] == "torch-musa"
 
 
@@ -149,20 +144,23 @@ def test_source_probe_handles_top_level_module(tmp_path, monkeypatch):
     monkeypatch.setattr(_compat, "find_spec_without_watchers", fake_find_spec)
     assert _compat.module_source_contains("probe", "MARKER") is True
     assert _compat.module_source_contains("probe", "ABSENT") is False
-    # v2.0 contract: True/False/None -- a flat module has no submodule path,
+    # contract: True/False/None -- a flat module has no submodule path,
     # so a child probe is a straightforward "absent" (False), not "unknown".
     assert _compat.module_source_contains("probe.child", "MARKER") is False
 
 
-def test_source_probe_never_executes_the_target_module(tmp_path, monkeypatch, tracked_modules):
-    """Ported from test_source_probe_does_not_import_parents.  The probe
-    resolves dotted names by joining file paths off the top-level package's
-    spec (ported verbatim from the old engine): neither the parents nor the
-    target module's body ever executes."""
+def test_source_probe_never_executes_the_target_module(
+    tmp_path, monkeypatch, tracked_modules
+):
+    """Source probes resolve paths without executing parent or target bodies."""
     package = tmp_path / "gate_source_probe"
     package.mkdir()
-    (package / "__init__.py").write_text("raise RuntimeError('parent must not execute')\n")
-    (package / "child.py").write_text("MARKER = 1\nraise RuntimeError('child must not execute')\n")
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('parent must not execute')\n"
+    )
+    (package / "child.py").write_text(
+        "MARKER = 1\nraise RuntimeError('child must not execute')\n"
+    )
     monkeypatch.syspath_prepend(str(tmp_path))
     tracked_modules.add("gate_source_probe")
 
@@ -171,7 +169,9 @@ def test_source_probe_never_executes_the_target_module(tmp_path, monkeypatch, tr
     assert "gate_source_probe.child" not in sys.modules
     assert _compat.module_source_contains("gate_source_probe.child", "ABSENT") is False
     # a genuinely absent submodule file is False, not "unknown" (None)
-    assert _compat.module_source_contains("gate_source_probe.missing", "MARKER") is False
+    assert (
+        _compat.module_source_contains("gate_source_probe.missing", "MARKER") is False
+    )
 
 
 def test_missing_metadata_keeps_target_policy(monkeypatch):
@@ -184,7 +184,12 @@ def test_gated_chain_dependencies_and_reinstall(engine, stub_module, monkeypatch
     module = stub_module("gate_chain", value=1, consumer=1)
     patches = [
         AttrPatch("consumer", "gate_chain:consumer", lambda old: 9, requires=("old",)),
-        AttrPatch("old", "gate_chain:value", lambda old: old + 10, version_gates=("vendor <3",)),
+        AttrPatch(
+            "old",
+            "gate_chain:value",
+            lambda old: old + 10,
+            version_gates=("vendor <3",),
+        ),
         AttrPatch("always", "gate_chain:value", lambda old: old * 2),
     ]
     engine.register(patches)
@@ -194,7 +199,7 @@ def test_gated_chain_dependencies_and_reinstall(engine, stub_module, monkeypatch
     engine.uninstall()
     assert (module.value, module.consumer) == (1, 1)
 
-    # v2.0: there is no IGNORE_VERSION_GATES override.  A changed environment
+    # there is no IGNORE_VERSION_GATES override.  A changed environment
     # is re-evaluated by a fresh engine (config freezes once per engine).
     monkeypatch.setattr(_compat, "distribution_version", lambda name: "2.5")
     second = Engine()
@@ -209,9 +214,7 @@ def test_gated_chain_dependencies_and_reinstall(engine, stub_module, monkeypatch
 
 
 def test_hook_gate_rechecked_for_each_engine(engine, fake_package, monkeypatch):
-    """Ported from test_hook_gate_rechecked_on_reinstall (which used the
-    removed IGNORE_VERSION_GATES switch): each engine evaluates the gate at
-    its own import boundary against the metadata live at that time."""
+    """Each engine evaluates gates against metadata at its import boundary."""
     calls = []
 
     def make_hook(trigger):

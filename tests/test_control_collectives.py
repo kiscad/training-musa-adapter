@@ -1,4 +1,4 @@
-"""Regression contracts for source changes migrated out of Megatron-LM."""
+"""Regression contracts for Megatron control-collective adaptations."""
 
 from io import BytesIO
 from signal import SIGTERM, Signals
@@ -6,8 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from tests.conftest import integration_env
 
+from tests.conftest import integration_env
 from training_musa_adaptor.patches.megatron import control_collectives as control
 
 torch = pytest.importorskip("torch")
@@ -25,7 +25,10 @@ def make_torch(backend="mccl"):
     )
     return (
         SimpleNamespace(
-            distributed=dist, float64=torch.float64, int64=torch.int64, tensor=torch.tensor
+            distributed=dist,
+            float64=torch.float64,
+            int64=torch.int64,
+            tensor=torch.tensor,
         ),
         dist,
     )
@@ -106,7 +109,9 @@ def test_checkpoint_group_cache_and_reinitialization():
     assert dist.new_group.call_count == 2
 
 
-@pytest.mark.parametrize("initialized,backend", [(False, "mccl"), (True, "nccl"), (True, "gloo")])
+@pytest.mark.parametrize(
+    "initialized,backend", [(False, "mccl"), (True, "nccl"), (True, "gloo")]
+)
 def test_other_backends_keep_default_group(initialized, backend):
     base, dist = make_torch(backend)
     dist.is_initialized = lambda: initialized
@@ -263,17 +268,24 @@ def test_checkpoint_exit_policy(iteration, elapsed, saves, exits):
         torch=SimpleNamespace(
             int=torch.int,
             tensor=lambda data, **kw: torch.tensor(data, dtype=kw["dtype"]),
-            distributed=SimpleNamespace(all_reduce=Mock(), ReduceOp=torch.distributed.ReduceOp),
+            distributed=SimpleNamespace(
+                all_reduce=Mock(), ReduceOp=torch.distributed.ReduceOp
+            ),
         ),
     )
     exec(
         compile(
-            ast.Module(body=[function], type_ignores=[]), str(TRAINING / "training.py"), "exec"
+            ast.Module(body=[function], type_ignores=[]),
+            str(TRAINING / "training.py"),
+            "exec",
         ),
         namespace,
     )
     assert (
-        namespace["checkpoint_and_decide_exit"](None, None, None, iteration, 0, None, None) is exits
+        namespace["checkpoint_and_decide_exit"](
+            None, None, None, iteration, 0, None, None
+        )
+        is exits
     )
     assert save.call_count == saves
 

@@ -1,6 +1,6 @@
 """Integration: transformers RMSNorm end-to-end on MUSA (S1 exit condition).
 
-The no-Megatron sample of the v2.0 architecture: the automatic channel must
+The transformers-only activation contract: the automatic channel must
 apply the patch at the import boundary without any adaptor import in user
 code, without Megatron installed/loaded, and with exact delegation semantics
 for everything outside the fully matched fp16/bf16 MUSA path.
@@ -29,7 +29,9 @@ pytestmark = pytest.mark.musa
 
 
 def _run(code: str, env_extra: dict[str, str] | None = None):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")}
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")
+    }
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"  # the real automatic channel
     env.update(env_extra or {})
     return subprocess.run(
@@ -45,8 +47,7 @@ def _run(code: str, env_extra: dict[str, str] | None = None):
 @pytest.mark.skipif(not musa_available, reason="no live MUSA stack")
 class TestRMSNormMusa:
     def test_automatic_channel_applies_without_megatron(self):
-        result = _run(
-            """
+        result = _run("""
             import sys
             import torch  # the entry point installs the watcher here
             import torch_musa
@@ -57,16 +58,14 @@ class TestRMSNormMusa:
             print("STATUS:", by_id["transformers.qwen3-vl.text-rms-norm.fused-torch"])
             print("MEGATRON-LOADED:", any(n == "megatron" for n in sys.modules))
             print("ATTN-PATCH:", by_id["megatron.te.attention.capability-dispatch"])
-            """
-        )
+            """)
         assert result.returncode == 0, result.stderr
         assert "STATUS: applied" in result.stdout
         assert "MEGATRON-LOADED: False" in result.stdout
         assert "ATTN-PATCH: pending" in result.stdout
 
     def test_forward_backward_and_delegation(self):
-        result = _run(
-            """
+        result = _run("""
             import torch
             import torch_musa
             import transformers.models.qwen3_vl.modeling_qwen3_vl as m
@@ -97,8 +96,7 @@ class TestRMSNormMusa:
             out_fp32 = norm(x.detach().float())
             assert out_fp32.dtype == torch.float32
             print("OK", diff)
-            """
-        )
+            """)
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout
 

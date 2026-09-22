@@ -11,15 +11,21 @@ import sys
 import types
 
 import pytest
+from packaging.version import Version
 
 from training_musa_adaptor.patches import PATCHES
 from training_musa_adaptor.patches.megatron import cuda_graphs as gate
 
 torch = pytest.importorskip("torch")
+torch_musa = pytest.importorskip("torch_musa")
 
+# Gate only the hardware cases; CPU contracts still run on older stacks.
 musa_device = pytest.mark.skipif(
-    not (hasattr(torch, "musa") and torch.musa.is_available()),
-    reason="requires a live MUSA device",
+    Version(torch_musa.__version__) < Version("2.9.0") or not torch_musa.is_available(),
+    reason=(
+        "cuda-graph requires torch_musa >= 2.9.0 and a live MUSA device "
+        f"(installed: {torch_musa.__version__})"
+    ),
 )
 
 
@@ -60,7 +66,7 @@ def test_patch_is_registered_with_megatron_trigger():
     matches = [p for p in PATCHES if p.id == "megatron.te.make-weak-ref.graph-compat"]
     assert len(matches) == 1
     patch = matches[0]
-    # v2.0: namespace roots are not hook boundaries; the concrete boundary
+    # namespace roots are not hook boundaries; the concrete boundary
     # is megatron.core.parallel_state (reachable in both import orders)
     assert patch.trigger == "megatron.core.parallel_state"
     assert callable(patch.run) and callable(patch.undo)
@@ -130,7 +136,11 @@ def test_self_check_passes_on_live_musa():
 
 
 def _fake_torch(
-    *, graph_ctx="stock", musa_graph=True, generator_trio=True, register_generator_state=True
+    *,
+    graph_ctx="stock",
+    musa_graph=True,
+    generator_trio=True,
+    register_generator_state=True,
 ):
     """A torch module shaped like an adapted (or unadapted) MUSA build."""
     fake = types.ModuleType("torch")
@@ -262,7 +272,9 @@ def test_declines_when_prerequisites_are_missing(te_utils, monkeypatch):
     monkeypatch.setattr(
         gate,
         "_missing_graph_prerequisites",
-        lambda: ["torch.cuda.CUDAGraph cannot register generator states (graph-safe RNG)"],
+        lambda: [
+            "torch.cuda.CUDAGraph cannot register generator states (graph-safe RNG)"
+        ],
     )
     assert gate._install_make_weak_ref() is False
     assert "make_weak_ref" not in vars(te_utils)

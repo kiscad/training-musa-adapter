@@ -1,9 +1,4 @@
-"""Attention ops tests: capability windows, candidates, selection (CPU-safe).
-
-Ported intent from megatron-musa-patch ``tests/test_attention_fallback.py``
-and the round-1 ``test_attention_selection.py``, rewritten for the v2.0
-plain-function ops layer (no Provider/Binding protocol).
-"""
+"""Attention ops tests: capability windows, candidates, selection (CPU-safe)."""
 
 from __future__ import annotations
 
@@ -76,7 +71,8 @@ class TestMudnnWindow:
     @pytest.mark.parametrize("head_dim", [144, 168, 176, 184, 192])
     def test_backward_window_rejects_broken_dims_in_training(self, head_dim):
         ok, reason = supports(
-            "mudnn", meta(head_dim_qk=head_dim, head_dim_v=head_dim, may_require_backward=True)
+            "mudnn",
+            meta(head_dim_qk=head_dim, head_dim_v=head_dim, may_require_backward=True),
         )
         assert not ok and "backward" in reason
         # inference-only keeps the fast forward for the full window
@@ -86,12 +82,15 @@ class TestMudnnWindow:
     @pytest.mark.parametrize("safe_dim", [64, 80, 96, 112, 128, 160])
     def test_backward_safe_dims_supported_in_training(self, safe_dim):
         ok, _ = supports(
-            "mudnn", meta(head_dim_qk=safe_dim, head_dim_v=safe_dim, may_require_backward=True)
+            "mudnn",
+            meta(head_dim_qk=safe_dim, head_dim_v=safe_dim, may_require_backward=True),
         )
         assert ok
 
     def test_backward_window_rejects_mixed_dims(self):
-        ok, reason = supports("mudnn", meta(head_dim_qk=192, head_dim_v=128, may_require_backward=True))
+        ok, reason = supports(
+            "mudnn", meta(head_dim_qk=192, head_dim_v=128, may_require_backward=True)
+        )
         assert not ok and "backward" in reason
 
     def test_dropout_rejected(self):
@@ -111,13 +110,16 @@ class TestMateWindow:
     @pytest.mark.parametrize("head_dim", [144, 168, 176, 184, 192])
     def test_equal_broken_dims_supported(self, head_dim):
         ok, _ = supports(
-            "mate", meta(head_dim_qk=head_dim, head_dim_v=head_dim, may_require_backward=True)
+            "mate",
+            meta(head_dim_qk=head_dim, head_dim_v=head_dim, may_require_backward=True),
         )
         assert ok
 
     @pytest.mark.parametrize("dqk,dv", [(192, 128), (160, 128)])
     def test_verified_mixed_pairs_supported(self, dqk, dv):
-        ok, _ = supports("mate", meta(head_dim_qk=dqk, head_dim_v=dv, may_require_backward=True))
+        ok, _ = supports(
+            "mate", meta(head_dim_qk=dqk, head_dim_v=dv, may_require_backward=True)
+        )
         assert ok
 
     @pytest.mark.parametrize("dqk,dv", [(128, 64), (256, 128), (192, 160)])
@@ -137,10 +139,16 @@ class TestMateWindow:
 
     def test_bottom_right_requires_equal_lengths(self):
         assert supports(
-            "mate", meta(head_dim_qk=192, mask_kind="causal_bottom_right", seq_q=128, seq_k=128)
+            "mate",
+            meta(
+                head_dim_qk=192, mask_kind="causal_bottom_right", seq_q=128, seq_k=128
+            ),
         )[0]
         assert not supports(
-            "mate", meta(head_dim_qk=192, mask_kind="causal_bottom_right", seq_q=128, seq_k=256)
+            "mate",
+            meta(
+                head_dim_qk=192, mask_kind="causal_bottom_right", seq_q=128, seq_k=256
+            ),
         )[0]
 
     def test_gqa_indivisibility_rejected(self):
@@ -148,7 +156,7 @@ class TestMateWindow:
 
     def test_unnormalized_window_encoding_rejected(self):
         """TE's (-1, 0) causal encoding must be normalized by the patch;
-        the raw encoding must not reach the implementations (round-1 fix)."""
+        the raw encoding must not reach the implementations."""
         ok, reason = supports("mate", meta(head_dim_qk=192, sliding_window=(-1, 0)))
         assert not ok and "window" in reason
 
@@ -168,7 +176,9 @@ class TestTEUnfusedWindow:
         assert not supports("te_unfused", meta(cp_size=2))[0]
 
     def test_padding_without_mask_rejected(self):
-        ok, _ = supports("te_unfused", meta(mask_kind="padding", has_attention_mask=False))
+        ok, _ = supports(
+            "te_unfused", meta(mask_kind="padding", has_attention_mask=False)
+        )
         assert not ok
 
 
@@ -211,7 +221,9 @@ class TestResolveCandidates:
 
     def test_force_single(self):
         candidates, _ = ops.resolve_candidates("force", ("te_unfused",), "error")
-        assert [(c.kind, c.name) for c in candidates] == [("implementation", "te_unfused")]
+        assert [(c.kind, c.name) for c in candidates] == [
+            ("implementation", "te_unfused")
+        ]
 
     def test_force_unknown_raises(self):
         with pytest.raises(ops.NoCompatibleImplementation):
@@ -238,15 +250,22 @@ class TestSelectAndRun:
         original_run = impl.run_fn
         impl.run_fn = lambda payload, call: ran.append("mate")
         try:
-            candidates, pre = ops.resolve_candidates("prefer", ("mate", "mudnn"), "error")
+            candidates, pre = ops.resolve_candidates(
+                "prefer", ("mate", "mudnn"), "error"
+            )
             # mate cannot serve dim 128; mudnn can (fake its run too)
             mudnn = ops.IMPLEMENTATIONS["mudnn"]
             mudnn_run = mudnn.run_fn
             mudnn.run_fn = lambda payload, call: "mudnn-ran"
             try:
                 result = ops.select_and_run(
-                    "test", candidates, pre, meta(), self._call("x"),
-                    self._original_supports, self._original,
+                    "test",
+                    candidates,
+                    pre,
+                    meta(),
+                    self._call("x"),
+                    self._original_supports,
+                    self._original,
                 )
             finally:
                 mudnn.run_fn = mudnn_run
@@ -264,8 +283,13 @@ class TestSelectAndRun:
             candidates, _ = ops.resolve_candidates("auto", (), "reference")
             with pytest.raises(RuntimeError, match="mid-kernel"):
                 ops.select_and_run(
-                    "test", candidates, [], meta(), self._call("x"),
-                    self._original_supports, self._original,
+                    "test",
+                    candidates,
+                    [],
+                    meta(),
+                    self._call("x"),
+                    self._original_supports,
+                    self._original,
                 )
         finally:
             mudnn.run_fn = original_run
@@ -274,8 +298,13 @@ class TestSelectAndRun:
         # dim 32: nothing supports it, original does
         candidates, pre = ops.resolve_candidates("auto", (), "upstream")
         result = ops.select_and_run(
-            "test", candidates, pre, meta(head_dim_qk=32, head_dim_v=32), self._call("x"),
-            self._original_supports, self._original,
+            "test",
+            candidates,
+            pre,
+            meta(head_dim_qk=32, head_dim_v=32),
+            self._call("x"),
+            self._original_supports,
+            self._original,
         )
         assert result == "original-ran"
 
@@ -283,8 +312,13 @@ class TestSelectAndRun:
         candidates, pre = ops.resolve_candidates("auto", (), "error")
         with pytest.raises(ops.NoCompatibleImplementation) as excinfo:
             ops.select_and_run(
-                "test", candidates, pre, meta(head_dim_qk=32, head_dim_v=32), self._call("x"),
-                self._original_supports, self._original,
+                "test",
+                candidates,
+                pre,
+                meta(head_dim_qk=32, head_dim_v=32),
+                self._call("x"),
+                self._original_supports,
+                self._original,
             )
         assert "mudnn" in str(excinfo.value) and "mate" in str(excinfo.value)
 
@@ -292,7 +326,12 @@ class TestSelectAndRun:
         candidates, _ = ops.resolve_candidates("auto", (), "upstream")
         with pytest.raises(ops.NoCompatibleImplementation) as excinfo:
             ops.select_and_run(
-                "test", candidates, [], meta(head_dim_qk=32, head_dim_v=32), self._call("x"),
-                lambda call: (False, "original not ok"), self._original,
+                "test",
+                candidates,
+                [],
+                meta(head_dim_qk=32, head_dim_v=32),
+                self._call("x"),
+                lambda call: (False, "original not ok"),
+                self._original,
             )
         assert "original: original not ok" in str(excinfo.value)

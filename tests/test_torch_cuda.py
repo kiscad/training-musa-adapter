@@ -4,16 +4,15 @@ Unit tests use small synthetic modules: importing this test file never imports
 an accelerator dependency. Only tests requesting the ``torch`` fixture require
 a usable MUSA device; adapter availability alone is not enough to run them.
 
-Ported from megatron-musa-patch ``tests/test_torch_cuda.py`` (rev a1090de) to
-the v2.0 engine API (``Engine.install()``/``uninstall()``, dict ``report()``,
-``TRAINING_MUSA_ADAPTOR_*`` switches). v2.0-specific changes:
+Engine API notes (``Engine.install()``/``uninstall()``, dict ``report()``,
+``TRAINING_MUSA_ADAPTOR_*`` switches):
 
 - hooks run at the real before-exec boundary, so engine-level hook tests use
   synthetic *importable* modules instead of a pre-stubbed ``megatron`` root
-  (the v2.0 engine never re-runs a hook for an already-imported trigger --
+  (the engine never re-runs a hook for an already-imported trigger --
   that is the phase_missed contract, and it is asserted here);
 - the hook declines (skipped) instead of raising when no MUSA device is
-  visible: CPU/CUDA processes keep original behavior (design doc §5.1);
+  visible: CPU/CUDA processes keep original behavior;
 - subprocess rounds pin the real megatron/transformers trigger boundaries in
   both import orders.
 """
@@ -27,7 +26,6 @@ import subprocess
 import sys
 import textwrap
 import types
-from pathlib import Path
 
 import pytest
 
@@ -152,7 +150,9 @@ def fake_backend(monkeypatch):
     # Preserve any unrelated real-runtime backend state a caller already owns.
     monkeypatch.setattr(torch_cuda, "_APPLIED", False)
     monkeypatch.setattr(torch_cuda, "_OVERRIDES", [])
-    yield types.SimpleNamespace(torch=torch, adapter=adapter, state=state, graphs=graphs)
+    yield types.SimpleNamespace(
+        torch=torch, adapter=adapter, state=state, graphs=graphs
+    )
     torch_cuda.unapply()
 
 
@@ -180,7 +180,7 @@ def test_backend_import_is_lazy():
 
 
 def test_patch_registration_is_lazy():
-    """patches/ must import without torch, torchada or any framework (§4.3)."""
+    """patches/ must import without torch, torchada or any framework."""
     env = dict(
         os.environ,
         TRAINING_MUSA_ADAPTOR_ENABLED="0",
@@ -205,7 +205,11 @@ def test_patch_registration_is_lazy():
 
 def test_apply_unapply_reinstall_restores_exact_bindings(fake_backend):
     torch = fake_backend.torch
-    originals = dict(vars(torch.cuda)), dict(vars(torch.Tensor)), dict(vars(fake_backend.graphs))
+    originals = (
+        dict(vars(torch.cuda)),
+        dict(vars(torch.Tensor)),
+        dict(vars(fake_backend.graphs)),
+    )
     torch_cuda.unapply()  # Safe before activation.
     torch_cuda.apply()
     first_type = torch.Tensor.type
@@ -237,7 +241,7 @@ def test_apply_unapply_reinstall_restores_exact_bindings(fake_backend):
 
 
 def test_ensure_cuda_compat_is_the_idempotent_helper(fake_backend):
-    """Design §4.2: one helper every framework hook calls; the first call
+    """one helper every framework hook calls; the first call
     owns the layer, later calls decline without acquiring undo ownership."""
     assert torch_cuda.ensure_cuda_compat() is True
     assert torch_cuda.is_applied()
@@ -249,7 +253,7 @@ def test_ensure_cuda_compat_is_the_idempotent_helper(fake_backend):
 
 
 def test_ensure_cuda_compat_declines_without_musa_and_skips_torchada(fake_backend):
-    """CPU/CUDA processes keep original behavior: no torchada import (§5.1)."""
+    """CPU/CUDA processes keep original behavior: no torchada import."""
     fake_backend.state["available"] = False
     monkeypatched = sys.modules["torchada"]
     assert torch_cuda.ensure_cuda_compat() is False
@@ -269,11 +273,17 @@ def test_availability_is_live_musa_probe_not_constant(fake_backend):
 def test_graph_capture_surface_is_routed_to_musa(fake_backend):
     """The stock CUDA-spelled capture APIs cannot capture; route them to MUSA."""
     torch = fake_backend.torch
-    stock = (torch.cuda.graph, torch.cuda.graph_pool_handle, torch.cuda.is_current_stream_capturing)
+    stock = (
+        torch.cuda.graph,
+        torch.cuda.graph_pool_handle,
+        torch.cuda.is_current_stream_capturing,
+    )
     torch_cuda.apply()
     assert torch.cuda.graph is torch.musa.graph
     assert torch.cuda.graph_pool_handle is torch.musa.graph_pool_handle
-    assert torch.cuda.is_current_stream_capturing is torch.musa.is_current_stream_capturing
+    assert (
+        torch.cuda.is_current_stream_capturing is torch.musa.is_current_stream_capturing
+    )
     torch_cuda.unapply()
     assert (
         torch.cuda.graph,
@@ -408,14 +418,20 @@ def test_older_adapter_public_api_remains_supported(fake_backend):
 
 def test_failed_override_rolls_back_and_can_retry(fake_backend, monkeypatch):
     torch = fake_backend.torch
-    originals = dict(vars(torch.cuda)), dict(vars(torch.Tensor)), dict(vars(fake_backend.graphs))
+    originals = (
+        dict(vars(torch.cuda)),
+        dict(vars(torch.Tensor)),
+        dict(vars(fake_backend.graphs)),
+    )
     fix = torch_cuda._fix_tensor_musa_for_subclasses
 
     def fail_after_mutation(torch):
         fix(torch)
         raise RuntimeError("injected activation failure")
 
-    monkeypatch.setattr(torch_cuda, "_fix_tensor_musa_for_subclasses", fail_after_mutation)
+    monkeypatch.setattr(
+        torch_cuda, "_fix_tensor_musa_for_subclasses", fail_after_mutation
+    )
     with pytest.raises(RuntimeError, match="injected activation failure"):
         torch_cuda.apply()
     assert not torch_cuda.is_applied()
@@ -454,7 +470,11 @@ def test_failed_unapply_keeps_cleanup_retryable(fake_backend):
 
     class FailingUndoCuda(types.ModuleType):
         def __setattr__(self, name, value):
-            if name == "is_available" and value is original_available and state["reject_undo"]:
+            if (
+                name == "is_available"
+                and value is original_available
+                and state["reject_undo"]
+            ):
                 raise RuntimeError("temporary cleanup failure")
             super().__setattr__(name, value)
 
@@ -549,7 +569,9 @@ def test_plain_tensor_musa_delegates_unchanged(fake_backend):
     )
 
 
-@pytest.mark.parametrize("device,index", [(None, None), (2, 2), ("musa", None), ("musa:3", 3)])
+@pytest.mark.parametrize(
+    "device,index", [(None, None), (2, 2), ("musa", None), ("musa:3", 3)]
+)
 def test_subclass_musa_preserves_transfer_options(fake_backend, device, index):
     torch = fake_backend.torch
 
@@ -620,7 +642,9 @@ def test_transformers_device_cache_refresh_on_unapply(fake_backend, monkeypatch)
     assert not is_torch_cuda_available()
 
 
-def test_device_refresh_preserves_unrelated_transformers_cache(fake_backend, monkeypatch):
+def test_device_refresh_preserves_unrelated_transformers_cache(
+    fake_backend, monkeypatch
+):
     from functools import lru_cache
 
     module = types.ModuleType("transformers.utils.import_utils")
@@ -640,7 +664,7 @@ def test_device_refresh_preserves_unrelated_transformers_cache(fake_backend, mon
 
 
 # ---------------------------------------------------------------------------
-# Platform hooks (patches/platform.py): v2.0 before-exec boundary semantics.
+# Platform hooks (patches/platform.py): before-exec boundary semantics.
 # ---------------------------------------------------------------------------
 
 
@@ -657,7 +681,9 @@ def _platform_hook(engine, fake_package, index, module_name):
 def test_platform_hook_metadata(engine):
     from training_musa_adaptor.patches import platform
 
-    megatron_primary, megatron_late, transformers_primary, transformers_late = platform.PATCHES
+    megatron_primary, megatron_late, transformers_primary, transformers_late = (
+        platform.PATCHES
+    )
     assert megatron_primary.id == "torch.cuda.compat-layer"
     assert megatron_primary.trigger == "megatron.core"
     assert megatron_late.trigger == "megatron.core.parallel_state"
@@ -698,9 +724,11 @@ def test_hook_applies_at_real_import_boundary(fake_backend, engine, fake_package
 def test_hook_for_already_imported_trigger_is_phase_missed_not_rerun_late(
     fake_backend, engine, fake_package
 ):
-    """v2.0 contract: a hook whose boundary was missed is reported
-    phase_missed; the engine never re-runs it late (design doc §5.2/§7.3)."""
-    importlib.import_module(_platform_hook(engine, fake_package, 0, "synth_early_boundary").trigger)
+    """contract: a hook whose boundary was missed is reported
+    phase_missed; the engine never re-runs it late."""
+    importlib.import_module(
+        _platform_hook(engine, fake_package, 0, "synth_early_boundary").trigger
+    )
     engine.install()
     record = engine.report()["patches"][0]
     assert record["status"] == "skipped"
@@ -708,7 +736,9 @@ def test_hook_for_already_imported_trigger_is_phase_missed_not_rerun_late(
     assert not torch_cuda.is_applied()
 
 
-def test_hook_does_not_acquire_another_callers_active_layer(fake_backend, engine, fake_package):
+def test_hook_does_not_acquire_another_callers_active_layer(
+    fake_backend, engine, fake_package
+):
     _platform_hook(engine, fake_package, 0, "synth_owned_elsewhere")
     torch_cuda.apply()
     active_type = fake_backend.torch.Tensor.type
@@ -722,7 +752,9 @@ def test_hook_does_not_acquire_another_callers_active_layer(fake_backend, engine
     assert fake_backend.torch.Tensor.type is active_type
 
 
-def test_hook_declines_without_musa_and_imports_no_torchada(fake_backend, engine, fake_package):
+def test_hook_declines_without_musa_and_imports_no_torchada(
+    fake_backend, engine, fake_package
+):
     fake_backend.state["available"] = False
     _platform_hook(engine, fake_package, 0, "synth_cpu_boundary")
     engine.install()
@@ -737,16 +769,14 @@ def test_hook_declines_without_musa_and_imports_no_torchada(fake_backend, engine
 def test_first_fired_hook_owns_the_shared_layer(fake_backend, engine, fake_package):
     """Two framework hooks, one helper: whichever boundary fires first owns
     the undo; the second declines. Multi-framework activation needs no
-    cross-framework dependency graph (design doc §4.2)."""
+    cross-framework dependency graph."""
     _platform_hook(engine, fake_package, 0, "synth_framework_a")
     _platform_hook(engine, fake_package, 1, "synth_framework_b")
     engine.install()
     importlib.import_module("synth_framework_a")
     importlib.import_module("synth_framework_b")
     records = {record["id"]: record for record in engine.report()["patches"]}
-    by_trigger = {
-        record["target"]: record["status"] for record in records.values()
-    }
+    by_trigger = {record["target"]: record["status"] for record in records.values()}
     assert by_trigger["synth_framework_a (hook)"] == "applied"
     assert by_trigger["synth_framework_b (hook)"] == "skipped"
     assert torch_cuda.is_applied()
@@ -756,7 +786,7 @@ def test_first_fired_hook_owns_the_shared_layer(fake_backend, engine, fake_packa
 
 def test_namespace_trigger_is_marked_failed(engine, tmp_path, monkeypatch):
     """A namespace package has no execution body: the engine marks the hook
-    failed instead of guessing a boundary (design doc §5.2)."""
+    failed instead of guessing a boundary."""
     from training_musa_adaptor.patches import platform
 
     nsroot = tmp_path / "nsroot"
@@ -773,14 +803,18 @@ def test_namespace_trigger_is_marked_failed(engine, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Real trigger boundaries in subprocesses (both import orders, design §5.1).
+# Real trigger boundaries in subprocesses (both import orders).
 # CPU-safe: without a visible MUSA device the hooks decline and the imports
 # keep their original behavior; on MUSA they install the layer.
 # ---------------------------------------------------------------------------
 
 
-def _run_activation_script(code: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")}
+def _run_activation_script(
+    code: str, extra_env: dict | None = None
+) -> subprocess.CompletedProcess:
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")
+    }
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
     env["TRAINING_MUSA_ADAPTOR_ENABLED"] = "1"
     if extra_env:
@@ -812,8 +846,7 @@ def _parse_output(result: subprocess.CompletedProcess) -> tuple[bool, bool, dict
 
 def test_megatron_torch_first_order_uses_megatron_core_boundary():
     pytest.importorskip("torch")
-    result = _run_activation_script(
-        """
+    result = _run_activation_script("""
         import json
         import torch  # watcher installs at the end of this import
         import megatron.core
@@ -823,8 +856,7 @@ def test_megatron_torch_first_order_uses_megatron_core_boundary():
         print("APPLIED", int(torch_cuda.is_applied()))
         statuses = {p["id"]: p["status"] for p in tma.report()["patches"]}
         print("STATUSES", json.dumps(statuses))
-        """
-    )
+        """)
     assert result.returncode == 0, result.stdout + result.stderr
     musa, applied, statuses = _parse_output(result)
     assert applied is musa
@@ -843,8 +875,7 @@ def test_megatron_first_order_uses_parallel_state_boundary():
     tensor_parallel/cross_entropy.py; megatron.core's own boundary is gone
     before the watcher exists, so the parallel_state hook does the work."""
     pytest.importorskip("torch")
-    result = _run_activation_script(
-        """
+    result = _run_activation_script("""
         import json
         import megatron.core  # deliberately the first heavy import
         from training_musa_adaptor.backends import musa_available, torch_cuda
@@ -853,8 +884,7 @@ def test_megatron_first_order_uses_parallel_state_boundary():
         print("APPLIED", int(torch_cuda.is_applied()))
         statuses = {p["id"]: p["status"] for p in tma.report()["patches"]}
         print("STATUSES", json.dumps(statuses))
-        """
-    )
+        """)
     assert result.returncode == 0, result.stdout + result.stderr
     musa, applied, statuses = _parse_output(result)
     assert applied is musa
@@ -873,8 +903,7 @@ def test_transformers_modeling_first_order_uses_modeling_utils_boundary():
     module's own boundary (and with it the RMSNorm AttrPatch) is missed --
     pinned here as the documented compatibility gap."""
     pytest.importorskip("torch")
-    result = _run_activation_script(
-        """
+    result = _run_activation_script("""
         import json
         import transformers.models.qwen3_vl.modeling_qwen3_vl  # first heavy import
         from training_musa_adaptor.backends import musa_available, torch_cuda
@@ -883,19 +912,22 @@ def test_transformers_modeling_first_order_uses_modeling_utils_boundary():
         print("APPLIED", int(torch_cuda.is_applied()))
         statuses = {p["id"]: p["status"] for p in tma.report()["patches"]}
         print("STATUSES", json.dumps(statuses))
-        """
-    )
+        """)
     assert result.returncode == 0, result.stdout + result.stderr
     musa, applied, statuses = _parse_output(result)
     assert applied is musa
     # The transformers root boundary ran before the watcher existed (the
     # parent package executed before torch's first import inside the chain):
-    # per design §7.3 the missed hook is reported phase_missed, not pending.
+    # A missed hook is reported phase_missed, not pending.
     assert statuses["torch.cuda.compat-layer.transformers"] == "skipped"
     if musa:
-        assert statuses["torch.cuda.compat-layer.transformers-late-boundary"] == "applied"
+        assert (
+            statuses["torch.cuda.compat-layer.transformers-late-boundary"] == "applied"
+        )
     else:
-        assert statuses["torch.cuda.compat-layer.transformers-late-boundary"] == "skipped"
+        assert (
+            statuses["torch.cuda.compat-layer.transformers-late-boundary"] == "skipped"
+        )
     # Documented gap: the RMSNorm patch cannot apply in this import order.
     assert statuses["transformers.qwen3-vl.text-rms-norm.fused-torch"] == "pending"
 
@@ -949,7 +981,9 @@ def test_tensor_type_reports_cuda_names(torch):
 @pytest.mark.musa
 def test_cuda_graph_class_is_bound(torch):
     assert torch.cuda.CUDAGraph is torch.musa.MUSAGraph
-    assert importlib.import_module("torch.cuda.graphs").CUDAGraph is torch.musa.MUSAGraph
+    assert (
+        importlib.import_module("torch.cuda.graphs").CUDAGraph is torch.musa.MUSAGraph
+    )
 
 
 @pytest.mark.musa

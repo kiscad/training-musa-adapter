@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 
 from training_musa_adaptor.ops import gated_delta_rule as _gdn_ops
-from training_musa_adaptor.patches import mcore_bridge as _bridge
+from training_musa_adaptor.patches.mcore_bridge import ssm as _bridge
 from training_musa_adaptor.patches.megatron import ssm as _ssm
 
 CORE_GDN = "megatron.core.ssm.gated_delta_net"
@@ -68,7 +68,9 @@ def fake_musa(t):
     return t.as_subclass(FakeMusaTensor)
 
 
-def gdn_inputs(batch=1, seq=512, heads=8, dim=128, dtype=torch.bfloat16, g_dtype=torch.float32):
+def gdn_inputs(
+    batch=1, seq=512, heads=8, dim=128, dtype=torch.bfloat16, g_dtype=torch.float32
+):
     """fla-shaped tensors on the fake musa device (B, S, H, D / B, S, H)."""
     return (
         fake_musa(torch.randn(batch, seq, heads, dim, dtype=dtype)),
@@ -93,12 +95,17 @@ class StubStack:
         def varlen_supported(lengths, H, DK, DV, chunk_size=64):
             lengths = list(lengths)
             self.guard_calls["varlen"].append((lengths, H, DK, DV))
-            return varlen and DK == DV and DK in _HEAD_DIMS and all(
-                length >= _MIN_SEQ for length in lengths
+            return (
+                varlen
+                and DK == DV
+                and DK in _HEAD_DIMS
+                and all(length >= _MIN_SEQ for length in lengths)
             )
 
         stub_module("torch_kernels", __path__=[])
-        self.attention = stub_module("torch_kernels.attention", gated_delta_net=self.front_door)
+        self.attention = stub_module(
+            "torch_kernels.attention", gated_delta_net=self.front_door
+        )
         self.gdn_module = stub_module(
             "torch_kernels.attention.gated_delta_net",
             gated_delta_net=self.front_door,
@@ -116,7 +123,15 @@ class StubStack:
         tilelang.flash_linear_attention = flash_linear_attention
 
 
-def install(engine, stub_module, *, core_original=None, bridge_original=None, stack=True, **stack_kwargs):
+def install(
+    engine,
+    stub_module,
+    *,
+    core_original=None,
+    bridge_original=None,
+    stack=True,
+    **stack_kwargs,
+):
     """Stub the two GDN bindings (and optionally torch-kernels) for the engine."""
     core_original = core_original or Recorder("fla-result")
     bridge_original = bridge_original or Recorder("bridge-fla-result")
@@ -136,11 +151,18 @@ def call_kwargs(g, beta, **overrides):
 
 
 def test_unknown_keyword_stays_with_fla():
-    assert _gdn_ops._normalized_call(("q", "k", "v", "g", "beta"), {"use_beta_sigmoid_in_kernel": True}) is None
+    assert (
+        _gdn_ops._normalized_call(
+            ("q", "k", "v", "g", "beta"), {"use_beta_sigmoid_in_kernel": True}
+        )
+        is None
+    )
 
 
 def test_positional_and_keyword_forms_normalize():
-    assert _gdn_ops._normalized_call(("q", "k", "v"), {"g": "g", "beta": "b", "scale": 0.5}) == {
+    assert _gdn_ops._normalized_call(
+        ("q", "k", "v"), {"g": "g", "beta": "b", "scale": 0.5}
+    ) == {
         "q": "q",
         "k": "k",
         "v": "v",
@@ -149,12 +171,19 @@ def test_positional_and_keyword_forms_normalize():
         "scale": 0.5,
     }
     assert _gdn_ops._normalized_call(("q", "k", "v", "g", "beta", "extra"), {}) is None
-    assert _gdn_ops._normalized_call(("q", "k", "v"), {"g": "g"}) is None  # beta missing
+    assert (
+        _gdn_ops._normalized_call(("q", "k", "v"), {"g": "g"}) is None
+    )  # beta missing
     assert _gdn_ops._normalized_call((), {"q": "q"}) is None  # fla requires all five
 
 
 def test_duplicate_binding_stays_with_fla():
-    assert _gdn_ops._normalized_call(("q", "k"), {"k": "k2", "v": "v", "g": "g", "beta": "b"}) is None
+    assert (
+        _gdn_ops._normalized_call(
+            ("q", "k"), {"k": "k2", "v": "v", "g": "g", "beta": "b"}
+        )
+        is None
+    )
 
 
 # --- selection --------------------------------------------------------------
@@ -221,8 +250,12 @@ def test_fla_only_keywords_stay_with_fla(engine, stub_module):
     engine.install()
 
     q, k, v, g, beta = gdn_inputs()
-    core.chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_beta_sigmoid_in_kernel=True)
-    assert core_original.calls == [((q, k, v), {"g": g, "beta": beta, "use_beta_sigmoid_in_kernel": True})]
+    core.chunk_gated_delta_rule(
+        q, k, v, g=g, beta=beta, use_beta_sigmoid_in_kernel=True
+    )
+    assert core_original.calls == [
+        ((q, k, v), {"g": g, "beta": beta, "use_beta_sigmoid_in_kernel": True})
+    ]
     assert stack.front_door.calls == []
 
 
@@ -233,7 +266,9 @@ def test_unsupported_dtypes_stay_with_fla(engine, stub_module):
 
     q, k, v, g, beta = gdn_inputs(dtype=torch.float16)
     core.chunk_gated_delta_rule(q, k, v, g=g, beta=beta)
-    assert len(core_original.calls) == 1, "fp16 activations are outside the TileLang envelope"
+    assert (
+        len(core_original.calls) == 1
+    ), "fp16 activations are outside the TileLang envelope"
 
     q, k, v, g, beta = gdn_inputs(g_dtype=torch.bfloat16)
     core.chunk_gated_delta_rule(q, k, v, g=g, beta=beta)
@@ -275,7 +310,9 @@ def test_packed_calls_check_per_sequence_lengths(engine, stub_module):
     q, k, v, g, beta = gdn_inputs()
     cu_seqlens = fake_musa(torch.tensor([0, 256, 512], dtype=torch.int32))
     core.chunk_gated_delta_rule(q, k, v, g=g, beta=beta, cu_seqlens=cu_seqlens)
-    assert stack.front_door.calls, "a packed batch every sequence can serve must dispatch"
+    assert (
+        stack.front_door.calls
+    ), "a packed batch every sequence can serve must dispatch"
     assert stack.front_door.calls[-1][1]["cu_seqlens"] is cu_seqlens
     assert stack.guard_calls["varlen"] == [([256, 256], 8, 128, 128)]
 
@@ -287,21 +324,25 @@ def test_packed_calls_check_per_sequence_lengths(engine, stub_module):
 # --- patch lifecycle --------------------------------------------------------
 
 
-
-def test_broken_torch_kernels_stack_declines(engine, stub_module):
+def test_broken_torch_kernels_stack_reports_original_error(engine, stub_module):
     # A ``torch_kernels.attention`` without the front door (editable installs
     # bypass the parent's __path__, so break the attribute, not the package):
-    # the dispatch probe must decline the patch instead of breaking the first
-    # training step.
-    core, bridge, core_original, bridge_original, _ = install(engine, stub_module, stack=False)
+    # An installed but broken backend must retain the original import error.
+    core, bridge, core_original, bridge_original, _ = install(
+        engine, stub_module, stack=False
+    )
     stub_module("torch_kernels", __path__=[])
     stub_module("torch_kernels.attention", flash_attention=object())
-    engine.register(_ssm.PATCHES + _bridge.PATCHES)
-    engine.install()
+    import pytest
 
+    from training_musa_adaptor._errors import TrainingMusaAdaptorError
+
+    engine.register(_ssm.PATCHES + _bridge.PATCHES)
+    with pytest.raises(TrainingMusaAdaptorError, match="gated_delta_net") as failure:
+        engine.install()
+    assert isinstance(failure.value.__cause__, ImportError)
     assert core.chunk_gated_delta_rule is core_original
     assert bridge.chunk_gated_delta_rule is bridge_original
-    assert all(record["status"] == "skipped" for record in engine.report()["patches"])
 
 
 def test_missing_flas_binding_declines(engine, stub_module):
@@ -353,7 +394,7 @@ def test_fla_fallback_receives_the_original_arguments(engine, stub_module):
 
 def test_gdn_hardware_smoke():
     """Real-kernel GDN validation on MUSA (TileLang dispatch, numerics,
-    demotion and switch-off), ported worker from megatron-musa-patch."""
+    demotion and switch-off)."""
     import os
     import subprocess
     import sys
@@ -374,3 +415,50 @@ def test_gdn_hardware_smoke():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SSM_PASS all" in result.stdout
+
+
+def test_inconsistent_gdn_shapes_stay_with_fla(engine, stub_module):
+    core, _, original, _, stack = install(engine, stub_module)
+    engine.register(_ssm.PATCHES)
+    engine.install()
+    q, k, v, g, beta = gdn_inputs(seq=128)
+    for tensors in (
+        (q, k[:, :64], v, g, beta),
+        (q, k[..., :64], v, g, beta),
+        (q[:, :, :3], k[:, :, :3], v, g, beta),
+        (q, k, v, g[:, :64], beta),
+        (q, k, v, g, beta[:, :, :4]),
+    ):
+        assert core.chunk_gated_delta_rule(*tensors) == "fla-result"
+        assert original.calls[-1][0] == tensors
+    assert stack.front_door.calls == []
+    assert stack.guard_calls == {"dense": [], "varlen": []}
+
+
+def test_invalid_packed_offsets_stay_with_fla(engine, stub_module):
+    core, _, original, _, stack = install(engine, stub_module)
+    engine.register(_ssm.PATCHES)
+    engine.install()
+    tensors = gdn_inputs(seq=256)
+    for offsets, dtype in (
+        ([1, 257], torch.int32),
+        ([0, 128], torch.int32),
+        ([0, 256], torch.float32),
+        ([0, 256, 128, 256], torch.int32),
+    ):
+        cu = fake_musa(torch.tensor(offsets, dtype=dtype))
+        assert core.chunk_gated_delta_rule(*tensors, cu_seqlens=cu) == "fla-result"
+        assert original.calls[-1][1]["cu_seqlens"] is cu
+    assert stack.front_door.calls == []
+
+
+def test_grouped_value_heads_remain_supported(engine, stub_module):
+    core, _, original, _, stack = install(engine, stub_module)
+    engine.register(_ssm.PATCHES)
+    engine.install()
+    q, k, v, g, beta = gdn_inputs(seq=128)
+    assert (
+        core.chunk_gated_delta_rule(q[:, :, :4], k[:, :, :4], v, g, beta) == "tk-result"
+    )
+    assert len(stack.front_door.calls) == 1
+    assert not original.calls

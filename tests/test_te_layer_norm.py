@@ -1,17 +1,20 @@
-"""Norm-linear fallback: gradients, parameter names and checkpoint contract.
-
-Ported from megatron-musa-patch ``tests/test_te_layer_norm.py`` (rev a1090de).
-The retired ``MEGATRON_MUSA_PATCH_TE_FUSED_LAYERNORM`` opt-out test is dropped:
-v2.0 expresses "keep TE fused" as ``TRAINING_MUSA_ADAPTOR_DISABLE=<id>``."""
+"""Norm-linear fallback: gradients, parameter names and checkpoint contract."""
 
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from tests.conftest import integration_env
 
+from tests.conftest import integration_env
 from training_musa_adaptor.patches.megatron import layer_norm as _layer_norm
+
+
+@pytest.fixture(autouse=True)
+def _musa_factory_environment(monkeypatch):
+    # CPU contract tests exercise the replacement independently of host hardware.
+    monkeypatch.setattr(_layer_norm, "_musa_live", lambda: True)
+
 
 torch = pytest.importorskip("torch")
 
@@ -23,7 +26,9 @@ def test_norm_linear_contract(stub_module, monkeypatch, zero_centered, dtype):
     class Linear(torch.nn.Module):
         def __init__(self, input_size, output_size, *, config, **kwargs):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.randn(output_size, input_size, dtype=dtype))
+            self.weight = torch.nn.Parameter(
+                torch.randn(output_size, input_size, dtype=dtype)
+            )
             self.bias = torch.nn.Parameter(torch.randn(output_size, dtype=dtype))
 
         def forward(self, x):
@@ -33,7 +38,9 @@ def test_norm_linear_contract(stub_module, monkeypatch, zero_centered, dtype):
         return self.state_dict()
 
     stub_module(
-        "megatron.core.extensions.transformer_engine", HAVE_TE=True, TEColumnParallelLinear=Linear
+        "megatron.core.extensions.transformer_engine",
+        HAVE_TE=True,
+        TEColumnParallelLinear=Linear,
     )
     fallback = _layer_norm._unfused_te_layer_norm_linear(
         SimpleNamespace(sharded_state_dict=sharded)
@@ -55,16 +62,24 @@ def test_norm_linear_contract(stub_module, monkeypatch, zero_centered, dtype):
     expected = torch.nn.functional.linear(norm, module.weight.detach().double())
     actual, bias = module(x)
     assert bias is module.bias
-    tol = dict(atol=0.15, rtol=0.03) if dtype == torch.bfloat16 else dict(atol=1e-10, rtol=1e-10)
+    tol = (
+        dict(atol=0.15, rtol=0.03)
+        if dtype == torch.bfloat16
+        else dict(atol=1e-10, rtol=1e-10)
+    )
     torch.testing.assert_close(actual.double(), expected, **tol)
     grad = torch.randn_like(actual)
     actual.backward(grad)
     expected.backward(grad.double())
     torch.testing.assert_close(x.grad.double(), ref_x.grad, **tol)
-    torch.testing.assert_close(module.layer_norm_weight.grad.double(), ref_gamma.grad, **tol)
+    torch.testing.assert_close(
+        module.layer_norm_weight.grad.double(), ref_gamma.grad, **tol
+    )
     keys = {"weight", "bias", "layer_norm_weight"}
     keys.add("layer_norm_bias")
-    torch.testing.assert_close(module.layer_norm_bias.grad.double(), ref_bias.grad, **tol)
+    torch.testing.assert_close(
+        module.layer_norm_bias.grad.double(), ref_bias.grad, **tol
+    )
     assert set(module.sharded_state_dict()) == keys
     assert module.layer_norm_weight.sequence_parallel
     assert module.layer_norm_weight.allreduce
@@ -76,7 +91,9 @@ def test_norm_linear_contract(stub_module, monkeypatch, zero_centered, dtype):
 
 
 @pytest.mark.parametrize("zero_centered", [False, True])
-def test_rmsnorm_constructs_original_fused_module(stub_module, monkeypatch, zero_centered):
+def test_rmsnorm_constructs_original_fused_module(
+    stub_module, monkeypatch, zero_centered
+):
     calls = []
 
     class Linear(torch.nn.Module):
@@ -95,20 +112,25 @@ def test_rmsnorm_constructs_original_fused_module(stub_module, monkeypatch, zero
             return {}
 
     stub_module(
-        "megatron.core.extensions.transformer_engine", HAVE_TE=True, TEColumnParallelLinear=Linear
+        "megatron.core.extensions.transformer_engine",
+        HAVE_TE=True,
+        TEColumnParallelLinear=Linear,
     )
     patched = _layer_norm._unfused_te_layer_norm_linear(Original)
-    config = SimpleNamespace(normalization="RMSNorm", layernorm_zero_centered_gamma=zero_centered)
-    options = dict(config=config, bias=False, skip_bias_add=True, tp_group=object(), stride=3)
+    config = SimpleNamespace(
+        normalization="RMSNorm", layernorm_zero_centered_gamma=zero_centered
+    )
+    options = dict(
+        config=config, bias=False, skip_bias_add=True, tp_group=object(), stride=3
+    )
     module = patched(16, 8, **options)
     assert type(module) is Original
     assert isinstance(module, patched)
     assert type(module).forward is Original.forward
-    assert not hasattr(module, "_megatron_musa_patch_fallback")
+    assert not hasattr(module, "_tma_fallback")
     assert calls == [((16, 8), options)]
     x = torch.randn(2, 16)
     assert module(x) is x
-
 
 
 @pytest.mark.parametrize("normalization", ["LayerNorm"])
@@ -141,7 +163,9 @@ def test_norm_linear_absorbs_mixed_dtype_input(stub_module, monkeypatch, normali
         return self.state_dict()
 
     stub_module(
-        "megatron.core.extensions.transformer_engine", HAVE_TE=True, TEColumnParallelLinear=Linear
+        "megatron.core.extensions.transformer_engine",
+        HAVE_TE=True,
+        TEColumnParallelLinear=Linear,
     )
     fallback = _layer_norm._unfused_te_layer_norm_linear(
         SimpleNamespace(sharded_state_dict=sharded)
@@ -193,7 +217,11 @@ def test_te_unavailable_skips_norm_linear_patch(engine, stub_module):
         TELayerNormColumnParallelLinear=Original,
         TEColumnParallelLinear=te.pytorch.Linear,
     )
-    patch = next(p for p in _layer_norm.PATCHES if p.id == "megatron.te.layer-norm-linear.unfused")
+    patch = next(
+        p
+        for p in _layer_norm.PATCHES
+        if p.id == "megatron.te.layer-norm-linear.unfused"
+    )
     engine.register([patch])
     engine.install()
 
@@ -217,7 +245,9 @@ def _norm_linear_env(stub_module):
         return self.state_dict()
 
     stub_module(
-        "megatron.core.extensions.transformer_engine", HAVE_TE=True, TEColumnParallelLinear=Linear
+        "megatron.core.extensions.transformer_engine",
+        HAVE_TE=True,
+        TEColumnParallelLinear=Linear,
     )
     original = SimpleNamespace(sharded_state_dict=sharded)
     return _layer_norm._unfused_te_layer_norm_linear(original), original
@@ -275,7 +305,9 @@ def test_subclass_constructs_itself_for_rmsnorm(stub_module):
     x = torch.randn(2, 16)
     out, bias = module(x)
     reference = torch.nn.functional.rms_norm(x, (16,), module.layer_norm_weight, 1e-5)
-    torch.testing.assert_close(out, torch.nn.functional.linear(reference, module.weight))
+    torch.testing.assert_close(
+        out, torch.nn.functional.linear(reference, module.weight)
+    )
     assert bias is None
 
 
@@ -305,7 +337,9 @@ def test_subclass_with_layernorm_keeps_norm_bias(stub_module):
     reference = torch.nn.functional.layer_norm(
         x, (16,), module.layer_norm_weight, module.layer_norm_bias, 1e-5
     )
-    torch.testing.assert_close(out, torch.nn.functional.linear(reference, module.weight))
+    torch.testing.assert_close(
+        out, torch.nn.functional.linear(reference, module.weight)
+    )
 
 
 def test_base_class_rmsnorm_still_uses_fused_module(stub_module):
@@ -327,7 +361,9 @@ def test_base_class_rmsnorm_still_uses_fused_module(stub_module):
             return original_sharded(self, *args, **kwargs)
 
     stub_module(
-        "megatron.core.extensions.transformer_engine", HAVE_TE=True, TEColumnParallelLinear=Fused
+        "megatron.core.extensions.transformer_engine",
+        HAVE_TE=True,
+        TEColumnParallelLinear=Fused,
     )
     patched = _layer_norm._unfused_te_layer_norm_linear(Original)
     config = _norm_config("RMSNorm")
@@ -369,14 +405,18 @@ def test_musa_fp8_norm_linear(ranks):
 class _FakeTeNormBase(torch.nn.Module):
     """Minimal stand-in with the attribute surface the native forward reads."""
 
-    def __init__(self, in_features=8, out_features=6, normalization="LayerNorm", **overrides):
+    def __init__(
+        self, in_features=8, out_features=6, normalization="LayerNorm", **overrides
+    ):
         super().__init__()
         self.layer_norm_weight = torch.nn.Parameter(torch.randn(in_features).double())
         if normalization == "LayerNorm":
             self.layer_norm_bias = torch.nn.Parameter(torch.randn(in_features).double())
         else:
             self.layer_norm_bias = None
-        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features).double())
+        self.weight = torch.nn.Parameter(
+            torch.randn(out_features, in_features).double()
+        )
         self.bias = torch.nn.Parameter(torch.randn(out_features).double())
         self.weight_names = ("weight",)
         self.bias_names = ("bias",)
@@ -413,7 +453,9 @@ class _FakeTeNormBase(torch.nn.Module):
 def test_native_layernorm_linear_unfused_forward_backward(monkeypatch):
     """The eligible plain path: functional norm + F.linear, autograd intact."""
     monkeypatch.setattr(_layer_norm, "_musa_live", lambda: True)
-    monkeypatch.setattr(_layer_norm, "_te_native_module_eligible", lambda self, inp: True)
+    monkeypatch.setattr(
+        _layer_norm, "_te_native_module_eligible", lambda self, inp: True
+    )
     patched = _layer_norm._unfused_te_native_layernorm_linear(_FakeTeNormBase)
     module = patched(8, 6)
     x = torch.randn(4, 8, dtype=torch.float64, requires_grad=True)
@@ -441,9 +483,13 @@ def test_native_layernorm_linear_unfused_forward_backward(monkeypatch):
 
 def test_native_layernorm_linear_rmsnorm_and_bias_tail(monkeypatch):
     monkeypatch.setattr(_layer_norm, "_musa_live", lambda: True)
-    monkeypatch.setattr(_layer_norm, "_te_native_module_eligible", lambda self, inp: True)
+    monkeypatch.setattr(
+        _layer_norm, "_te_native_module_eligible", lambda self, inp: True
+    )
     patched = _layer_norm._unfused_te_native_layernorm_linear(_FakeTeNormBase)
-    module = patched(8, 6, normalization="RMSNorm", gemm_bias_unfused_add=True, return_bias=True)
+    module = patched(
+        8, 6, normalization="RMSNorm", gemm_bias_unfused_add=True, return_bias=True
+    )
     x = torch.randn(4, 8, dtype=torch.float64)
     out, bias = module(x)
     assert bias is module.bias
@@ -460,7 +506,9 @@ def test_native_layernorm_linear_rmsnorm_and_bias_tail(monkeypatch):
 
 def test_native_layernorm_linear_delegates_when_ineligible(monkeypatch):
     monkeypatch.setattr(_layer_norm, "_musa_live", lambda: True)
-    monkeypatch.setattr(_layer_norm, "_te_native_module_eligible", lambda self, inp: False)
+    monkeypatch.setattr(
+        _layer_norm, "_te_native_module_eligible", lambda self, inp: False
+    )
     patched = _layer_norm._unfused_te_native_layernorm_linear(_FakeTeNormBase)
     module = patched(8, 6)
     assert module(torch.randn(2, 8)) == "original"
@@ -468,7 +516,9 @@ def test_native_layernorm_linear_delegates_when_ineligible(monkeypatch):
 
 def test_native_layernorm_mlp_unfused_forward(monkeypatch):
     monkeypatch.setattr(_layer_norm, "_musa_live", lambda: True)
-    monkeypatch.setattr(_layer_norm, "_te_native_module_eligible", lambda self, inp: True)
+    monkeypatch.setattr(
+        _layer_norm, "_te_native_module_eligible", lambda self, inp: True
+    )
 
     class FakeMlp(_FakeTeNormBase):
         def __init__(self, in_features=8, ffn=12, **kw):
@@ -491,14 +541,13 @@ def test_native_layernorm_mlp_unfused_forward(monkeypatch):
     )
     h = torch.nn.functional.linear(ln, module.fc1_weight, module.fc1_bias)
     ref = torch.nn.functional.linear(
-        torch.nn.functional.gelu(h, approximate="tanh"), module.fc2_weight, module.fc2_bias
+        torch.nn.functional.gelu(h, approximate="tanh"),
+        module.fc2_weight,
+        module.fc2_bias,
     )
     torch.testing.assert_close(out, ref)
     out.sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
-
-
-
 
 
 def test_native_unfused_declines_without_musa(monkeypatch):
@@ -524,7 +573,9 @@ def test_native_norm_fp8_output_delegates(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["fp8", "calibration", "main_grad"])
-def test_native_norm_checks_current_context_before_prepare(monkeypatch, stub_module, mode):
+def test_native_norm_checks_current_context_before_prepare(
+    monkeypatch, stub_module, mode
+):
     monkeypatch.setattr(_layer_norm, "_musa_live", lambda: True)
     stub_module(
         "transformer_engine.pytorch.fp8",
@@ -533,7 +584,9 @@ def test_native_norm_checks_current_context_before_prepare(monkeypatch, stub_mod
             is_fp8_calibration=lambda: mode == "calibration",
         ),
     )
-    stub_module("transformer_engine.pytorch.cpu_offload", is_cpu_offload_enabled=lambda: False)
+    stub_module(
+        "transformer_engine.pytorch.cpu_offload", is_cpu_offload_enabled=lambda: False
+    )
     inp = SimpleNamespace(device=SimpleNamespace(type="musa"))
     monkeypatch.setattr(torch, "is_tensor", lambda t: t is inp)
     # Instance flags still describe the previous non-FP8 forward.

@@ -1,11 +1,7 @@
-# 来源: megatron-musa-patch/tests/test_patch_independence.py
-# 主要适配点: 旧文件针对旧注册表的具体补丁(_layer_norm/_rope/_control_collectives/
-# _training); v2.0 注册表(S2 起仅 megatron attention)不含这些补丁, 这里用同构的合成
-# 补丁把同样的独立性语义钉在引擎上——norm 三件套(类替换+两个跟随旗标)、
-# ONLY/DISABLE 选择不隐式启用伴随、缺失伴随按原因 skipped、单目标多 wrapper
-# 任意子集/顺序可交换、dispatch 运行时读活状态且用 vars() 有界探测;
-# 环境开关改名 TRAINING_MUSA_ADAPTOR_ONLY/DISABLE; 旧 torch 数值用例
-# (RMSNorm fallback) 随真实补丁迁移到对应契约测试, 不在此复制.
+# 要点: 用同构的合成补丁把独立性语义钉在引擎上——norm 三件套(类替换+两个跟随
+# 旗标)、ONLY/DISABLE 选择不隐式启用伴随、缺失伴随按原因 skipped、单目标多
+# wrapper 任意子集/顺序可交换、dispatch 运行时读活状态且用 vars() 有界探测;
+# 环境开关为 TRAINING_MUSA_ADAPTOR_ONLY/DISABLE.
 """Selective activation must not rely on incidental registration order."""
 
 from __future__ import annotations
@@ -78,10 +74,16 @@ def test_norm_flags_follow_class_in_any_registration_order(engine, stub_module, 
 
 
 @pytest.mark.parametrize("switch", ["ONLY", "DISABLE"])
-def test_flag_selection_does_not_enable_class_implicitly(engine, stub_module, monkeypatch, switch):
+def test_flag_selection_does_not_enable_class_implicitly(
+    engine, stub_module, monkeypatch, switch
+):
     original, module = _norm_module(stub_module, "test_norm_select")
     patches = _norm_trio(module.__name__)
-    selected = [p.id for p in patches if (p.attr_name == "FusedLayerNorm") == (switch == "DISABLE")]
+    selected = [
+        p.id
+        for p in patches
+        if (p.attr_name == "FusedLayerNorm") == (switch == "DISABLE")
+    ]
     monkeypatch.setenv("TRAINING_MUSA_ADAPTOR_" + switch, ",".join(selected))
     engine.register(patches)
     engine.install()
@@ -98,11 +100,13 @@ def test_independent_target_applies_without_sibling(engine, stub_module):
     """Mirror of the old block-norm test's independence half: a patch on one
     module applies cleanly without the sibling module's class replacement
     (no implicit cross-patch enabling, no torch numerics here -- those return
-    with the real migrated patch's contract tests)."""
+    with the actual patch's contract tests)."""
     upstream = type("BrokenApexNorm", (), {})
     local = stub_module("test_block_local", FusedLayerNorm=upstream)
     block = stub_module("test_block_impl", LayerNormImpl=lambda: "upstream")
-    engine.register([AttrPatch("test.block.impl", "test_block_impl:LayerNormImpl", _wrap("fb"))])
+    engine.register(
+        [AttrPatch("test.block.impl", "test_block_impl:LayerNormImpl", _wrap("fb"))]
+    )
     engine.install()
     assert block.LayerNormImpl() == "upstreamfb"
     assert local.FusedLayerNorm is upstream
@@ -170,7 +174,10 @@ def test_dispatch_observes_live_module_state(engine, stub_module, order):
     the wrapper was built is still observed; registration order of an
     unrelated sibling patch does not matter."""
     module = stub_module(
-        "test_rope_mod", fused_kernel=None, apply_op=lambda *args: "reference", FLAG=True
+        "test_rope_mod",
+        fused_kernel=None,
+        apply_op=lambda *args: "reference",
+        FLAG=True,
     )
 
     def replace(old):
@@ -195,7 +202,7 @@ def test_dispatch_observes_live_module_state(engine, stub_module, order):
 def test_dispatch_uses_bounded_vars_lookup(engine, stub_module):
     """Mirror of the old no-apex-probe test: dispatch probes the module's own
     __dict__ only -- a missing optional attribute must not wake any module
-    __getattr__ (bounded probe discipline, design §5.4)."""
+    __getattr__ (bounded probe discipline)."""
     module = stub_module("test_rope_safe", apply_op=lambda *args: "reference")
 
     def forbidden(name):

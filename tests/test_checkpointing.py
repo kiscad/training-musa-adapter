@@ -34,7 +34,9 @@ def writer(stub_module, monkeypatch):
             pytest.fail("forked launcher must not run")
 
         @staticmethod
-        def write_preloaded_data(transforms, idx, bucket, results_queue, count_queue, **kwargs):
+        def write_preloaded_data(
+            transforms, idx, bucket, results_queue, count_queue, **kwargs
+        ):
             results_queue.put((idx, [f"result-{idx}"]))
             count_queue.get()
             count_queue.task_done()
@@ -80,13 +82,16 @@ def test_worker_arguments_preserved(writer, monkeypatch, use_msc):
     sink = _Sink()
     writer.write_preloaded_data_multiproc(transforms, use_msc, 7, BUCKETS, sink)
     assert seen == [
-        (idx, bucket, {"use_fsync": True, "use_msc": use_msc}) for idx, bucket in enumerate(BUCKETS)
+        (idx, bucket, {"use_fsync": True, "use_msc": use_msc})
+        for idx, bucket in enumerate(BUCKETS)
     ]
     assert sink.payload == {0: [], 1: []}
 
 
 @pytest.mark.parametrize("failing_index", [0, 1])
-def test_failed_bucket_replaces_whole_payload_and_stops(writer, monkeypatch, failing_index):
+def test_failed_bucket_replaces_whole_payload_and_stops(
+    writer, monkeypatch, failing_index
+):
     error = RuntimeError(f"bucket {failing_index} failed")
     seen = []
 
@@ -131,7 +136,9 @@ def test_missing_result_publishes_failure_instead_of_escaping(writer, monkeypatc
         ((0,), ValueError, "not enough values"),
     ],
 )
-def test_malformed_result_publishes_failure(writer, monkeypatch, message, error_type, match):
+def test_malformed_result_publishes_failure(
+    writer, monkeypatch, message, error_type, match
+):
     def worker(transforms, idx, bucket, results_queue, count_queue, **kwargs):
         results_queue.put(message)
         count_queue.get()
@@ -142,7 +149,6 @@ def test_malformed_result_publishes_failure(writer, monkeypatch, message, error_
     writer.write_preloaded_data_multiproc([], False, 0, BUCKETS, sink)
     assert isinstance(sink.payload, error_type)
     assert match in str(sink.payload)
-
 
 
 def test_results_queue_is_fifo_and_never_blocks_when_empty():

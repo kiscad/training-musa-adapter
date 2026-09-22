@@ -1,6 +1,6 @@
 """Integration: Megatron attention patch on real MUSA (S2 hardware matrix).
 
-Ported from the round-1 hardware matrix to the v2.0 engine/config API.
+Exercises the framework binding and configured implementation on real MUSA tensors.
 The mate path (TileLang JIT) and packed THD are included; a cold
 ~/.tilelang cache makes the mate case compile for minutes on first run.
 """
@@ -28,7 +28,9 @@ pytestmark = pytest.mark.musa
 
 
 def _run(code: str, env_extra: dict[str, str] | None = None, timeout: int = 900):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")}
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("TRAINING_MUSA_ADAPTOR")
+    }
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
     env.update(env_extra or {})
     return subprocess.run(
@@ -78,9 +80,7 @@ def _script(body: str) -> str:
 @pytest.mark.skipif(not musa_available, reason="no live MUSA stack")
 class TestAttentionMusa:
     def test_automatic_channel_applies_and_runs_bf16(self):
-        result = _run(
-            _script(
-                """
+        result = _run(_script("""
                 attn = make_attn(heads=16)
                 q, k, v = qkv(512, 2, 16, 16, 64)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -90,16 +90,12 @@ class TestAttentionMusa:
                 by_id = {p["id"]: p["status"] for p in tma.report()["patches"]}
                 assert by_id["megatron.te.attention.capability-dispatch"] == "applied"
                 print("OK")
-                """
-            )
-        )
+                """))
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout
 
     def test_fp32_forward_backward(self):
-        result = _run(
-            _script(
-                """
+        result = _run(_script("""
                 attn = make_attn(heads=16)
                 q, k, v = qkv(512, 2, 16, 16, 64, dtype=torch.float32)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -107,16 +103,12 @@ class TestAttentionMusa:
                 out.backward(torch.ones_like(out))
                 assert torch.isfinite(q.grad).all()
                 print("OK")
-                """
-            )
-        )
+                """))
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout
 
     def test_gqa_forward_backward(self):
-        result = _run(
-            _script(
-                """
+        result = _run(_script("""
                 attn = make_attn(heads=8, groups=2)
                 q, k, v = qkv(512, 2, 8, 2, 64)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -125,16 +117,12 @@ class TestAttentionMusa:
                 out.to(torch.float32).pow(2).mean().backward()
                 assert torch.isfinite(q.grad).all() and torch.isfinite(k.grad).all()
                 print("OK")
-                """
-            )
-        )
+                """))
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout
 
     def test_mudnn_matches_te_unfused_reference(self):
-        auto = _run(
-            _script(
-                """
+        auto = _run(_script("""
                 attn = make_attn(heads=16)
                 q, k, v = qkv(512, 2, 16, 16, 64)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -143,14 +131,11 @@ class TestAttentionMusa:
                 path = os.path.join(tempfile.mkdtemp(), "auto.pt")
                 torch.save({"out": out.detach().cpu(), "g": q.grad.detach().cpu()}, path)
                 print(path)
-                """
-            )
-        )
+                """))
         assert auto.returncode == 0, auto.stderr
         path = auto.stdout.strip().splitlines()[-1]
         forced = _run(
-            _script(
-                f"""
+            _script(f"""
                 attn = make_attn(heads=16)
                 q, k, v = qkv(512, 2, 16, 16, 64)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -161,8 +146,7 @@ class TestAttentionMusa:
                 assert fwd < 2e-2, fwd
                 assert grd < 2e-2, grd
                 print("OK", fwd, grd)
-                """
-            ),
+                """),
             env_extra={
                 "TRAINING_MUSA_ADAPTOR_ATTN_POLICY": "force",
                 "TRAINING_MUSA_ADAPTOR_ATTN_IMPLS": "te_unfused",
@@ -174,15 +158,13 @@ class TestAttentionMusa:
     def test_policy_switch_changes_executed_path(self):
         """force te_unfused must change the actual computation vs auto."""
         result = _run(
-            _script(
-                """
+            _script("""
                 attn = make_attn(heads=16)
                 q, k, v = qkv(512, 2, 16, 16, 64)
                 out = attn(q, k, v, None, AttnMaskType.causal)
                 assert torch.isfinite(out).all()
                 print("OK")
-                """
-            ),
+                """),
             env_extra={
                 "TRAINING_MUSA_ADAPTOR_ATTN_POLICY": "force",
                 "TRAINING_MUSA_ADAPTOR_ATTN_IMPLS": "te_unfused",
@@ -193,8 +175,7 @@ class TestAttentionMusa:
 
     def test_force_mate_on_unsupported_input_fails_before_kernel(self):
         result = _run(
-            _script(
-                """
+            _script("""
                 attn = make_attn(heads=16)
                 q, k, v = qkv(512, 2, 16, 16, 64)  # dim 64 is outside mate's window
                 try:
@@ -205,8 +186,7 @@ class TestAttentionMusa:
                 except Exception as exc:
                     assert type(exc).__name__ == "NoCompatibleImplementation", type(exc)
                 print("OK")
-                """
-            ),
+                """),
             env_extra={
                 "TRAINING_MUSA_ADAPTOR_ATTN_POLICY": "force",
                 "TRAINING_MUSA_ADAPTOR_ATTN_IMPLS": "mate",
@@ -218,8 +198,7 @@ class TestAttentionMusa:
     def test_mate_dim192_forward_backward(self):
         """d=192 equal dims: mudnn backward rejects, mate serves (JIT warm)."""
         result = _run(
-            _script(
-                """
+            _script("""
                 attn = make_attn(heads=16, kv_channels=192)
                 q, k, v = qkv(512, 2, 16, 16, 192)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -227,8 +206,7 @@ class TestAttentionMusa:
                 out.to(torch.float32).pow(2).mean().backward()
                 assert torch.isfinite(q.grad).all() and torch.isfinite(k.grad).all()
                 print("OK")
-                """
-            ),
+                """),
             timeout=1800,
         )
         assert result.returncode == 0, result.stderr
@@ -236,8 +214,7 @@ class TestAttentionMusa:
 
     def test_mate_dim192_matches_reference(self):
         mate = _run(
-            _script(
-                """
+            _script("""
                 attn = make_attn(heads=16, kv_channels=192)
                 q, k, v = qkv(512, 2, 16, 16, 192)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -246,15 +223,13 @@ class TestAttentionMusa:
                 path = os.path.join(tempfile.mkdtemp(), "mate.pt")
                 torch.save({"out": out.detach().cpu(), "g": q.grad.detach().cpu()}, path)
                 print(path)
-                """
-            ),
+                """),
             timeout=1800,
         )
         assert mate.returncode == 0, mate.stderr
         path = mate.stdout.strip().splitlines()[-1]
         forced = _run(
-            _script(
-                f"""
+            _script(f"""
                 attn = make_attn(heads=16, kv_channels=192)
                 q, k, v = qkv(512, 2, 16, 16, 192)
                 out = attn(q, k, v, None, AttnMaskType.causal)
@@ -265,8 +240,7 @@ class TestAttentionMusa:
                 assert fwd < 2e-2, fwd   # bf16 tolerance
                 assert grd < 1e-1, grd   # measured ~0.5-0.7% of grad absmax 4-6
                 print("OK", fwd, grd)
-                """
-            ),
+                """),
             env_extra={
                 "TRAINING_MUSA_ADAPTOR_ATTN_POLICY": "force",
                 "TRAINING_MUSA_ADAPTOR_ATTN_IMPLS": "te_unfused",
@@ -278,9 +252,7 @@ class TestAttentionMusa:
     def test_packed_thd_with_padded_offsets(self):
         """Packed THD slicing: padded offsets stay finite (no NaN), padded
         rows are exactly zero, empty sequences keep zero-gradient edges."""
-        result = _run(
-            _script(
-                """
+        result = _run(_script("""
                 from megatron.core.packed_seq_params import PackedSeqParams
                 attn = make_attn(heads=16)
                 # the module keeps its default "sbhd"; the packed layout is
@@ -310,8 +282,6 @@ class TestAttentionMusa:
                 padded_grad = torch.cat([q.grad[128:192], q.grad[192:256], q.grad[352:384]])
                 assert (padded_grad == 0).all()
                 print("OK")
-                """
-            )
-        )
+                """))
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout

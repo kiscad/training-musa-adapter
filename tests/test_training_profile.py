@@ -1,6 +1,5 @@
 """Argument and startup compatibility policies (no GPU required)."""
 
-import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +7,11 @@ import pytest
 
 from training_musa_adaptor.patches.megatron import training as _training
 
+
+@pytest.fixture(autouse=True)
+def _musa_factory_environment(monkeypatch):
+    # CPU contract tests exercise the replacement independently of host hardware.
+    monkeypatch.setattr(_training, "musa_available", lambda: True)
 
 
 @pytest.fixture()
@@ -21,8 +25,12 @@ def test_overlap_validator_exception_propagates(overlap_policy):
         overlap_policy(original)(SimpleNamespace())
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch", "torch_dcp", "fsdp_dtensor"])
-def test_live_argument_patch_chain_never_rewrites_checkpoint_format(overlap_policy, ckpt_format):
+@pytest.mark.parametrize(
+    "ckpt_format", ["torch_dist", "torch", "torch_dcp", "fsdp_dtensor"]
+)
+def test_live_argument_patch_chain_never_rewrites_checkpoint_format(
+    overlap_policy, ckpt_format
+):
     args = SimpleNamespace(ckpt_format=ckpt_format, async_save=True, profile=True)
     wrapped = lambda args: args
     for patch in _training.PATCHES:
@@ -34,7 +42,9 @@ def test_live_argument_patch_chain_never_rewrites_checkpoint_format(overlap_poli
     assert args.ckpt_format == ckpt_format
     assert args.async_save is True
     assert args.use_pytorch_profiler is True
-    assert not any(p.id == "megatron.training.ckpt-format.no-torch-dist" for p in _training.PATCHES)
+    assert not any(
+        p.id == "megatron.training.ckpt-format.no-torch-dist" for p in _training.PATCHES
+    )
 
 
 def test_legacy_loader_noop_does_not_call_original():
@@ -50,5 +60,3 @@ def test_jit_warmup_policy_default_noops(monkeypatch):
     original = Mock()
     assert _training._noop_set_jit_fusion_options(original)() is None
     original.assert_not_called()
-
-
