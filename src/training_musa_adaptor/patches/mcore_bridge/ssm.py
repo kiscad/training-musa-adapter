@@ -7,16 +7,15 @@ so patching Megatron's binding alone never reaches the execution path of a
 Qwen3.5 mcore-bridge run.  mcore-bridge and Megatron-Bridge are different
 projects; do not mix the names.
 
-Migrated from megatron-musa-patch ``patches/_ssm.py`` (rev a1090de); the
-dispatcher is shared via ``ops/gated_delta_rule.py``.
+The dispatcher is shared with the Megatron patch via ``ops/gated_delta_rule.py``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .._engine import AttrPatch
-from ..ops.gated_delta_rule import make_tilelang_dispatcher
+from ..._engine import AttrPatch
+from ...ops.gated_delta_rule import make_tilelang_dispatcher
 
 __all__ = ["PATCHES"]
 

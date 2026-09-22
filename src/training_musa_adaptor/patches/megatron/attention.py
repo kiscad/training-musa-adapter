@@ -1,8 +1,7 @@
 """Megatron attention patch: TEDotProductAttention capability dispatch.
 
-Migrated from megatron-musa-patch ``patches/_attention.py`` (rev a1090de)
-with the first-round fixes kept: TE causal-window normalization, mate
-mixed head-dim support and the packed-THD/empty-sequence handling.
+Normalizes TE's causal-window encoding, covers mate mixed head-dim and
+handles the packed-THD/empty-sequence cases.
 
 The patch owns the *framework contract* (signature, masks, layouts, packed
 THD slicing, return shape); implementation selection lives in
@@ -21,6 +20,7 @@ import functools
 from typing import Any
 
 from ..._compat import module_source_contains
+from ..._config import ATTENTION_PATCH_ID
 from ..._engine import AttrPatch
 from ...backends import musa_available as _musa_live
 from ...ops import attention as _ops
@@ -28,7 +28,7 @@ from ...ops import attention as _ops
 __all__ = ["PATCHES"]
 
 _TARGET = "megatron.core.extensions.transformer_engine:TEDotProductAttention.forward"
-_PATCH_ID = "megatron.te.attention.capability-dispatch"
+_PATCH_ID = ATTENTION_PATCH_ID
 
 _ALLOWED_MASKS = {
     "no_mask",
@@ -46,7 +46,9 @@ _RESOLVED: dict[str, Any] = {}
 
 
 def _mask_type_name(attn_mask_type) -> str:
-    return (getattr(attn_mask_type, "name", None) or str(attn_mask_type)).replace(",", "_")
+    return (getattr(attn_mask_type, "name", None) or str(attn_mask_type)).replace(
+        ",", "_"
+    )
 
 
 def _attn_mask_type_value(name):
@@ -55,7 +57,7 @@ def _attn_mask_type_value(name):
         from megatron.core.transformer.enums import AttnMaskType
 
         return getattr(AttnMaskType, name)
-    except Exception:
+    except Exception:  # noqa: BLE001 - stub/test contexts lack the enum module
         from types import SimpleNamespace
 
         return SimpleNamespace(name=name)
@@ -68,10 +70,11 @@ def _frozen_selection():
 
     config = ENGINE.config.config
     selection = config.options_for(_PATCH_ID) or config.attention()
-    if "candidates" not in _RESOLVED:
+    if _RESOLVED.get("selection") != selection:
         candidates, pre_rejections = _ops.resolve_candidates(
             selection.policy, selection.implementations, selection.fallback
         )
+        _RESOLVED["selection"] = selection
         _RESOLVED["candidates"] = candidates
         _RESOLVED["pre_rejections"] = pre_rejections
     return selection, _RESOLVED["candidates"], _RESOLVED["pre_rejections"]
@@ -95,8 +98,18 @@ class _AttentionCall:
         "meta",
     )
 
-    def __init__(self, module, query, key, value, attention_mask, attn_mask_type,
-                 attention_bias, original, meta):
+    def __init__(
+        self,
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type,
+        attention_bias,
+        original,
+        meta,
+    ):
         self.module = module
         self.query = query
         self.key = key
@@ -122,14 +135,20 @@ def _may_require_backward(self, tensors) -> bool:
 
     if bool(getattr(self, "training", False)):
         return True
-    return torch.is_grad_enabled() and any(getattr(t, "requires_grad", False) for t in tensors)
+    return torch.is_grad_enabled() and any(
+        getattr(t, "requires_grad", False) for t in tensors
+    )
 
 
-def _eligible(self, query, key, value, packed, num_splits, mask_name, attention_mask) -> bool:
+def _eligible(
+    self, query, key, value, packed, num_splits, mask_name, attention_mask
+) -> bool:
     """Do not bypass upstream validation/parallel or quantization protocols."""
     import torch
 
     if any(type(t) is not torch.Tensor for t in (query, key, value)):
+        return False
+    if any(t.device != query.device for t in (key, value)):
         return False
     if any(
         t.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
@@ -172,19 +191,23 @@ def _eligible(self, query, key, value, packed, num_splits, mask_name, attention_
             return False
     if mask_name not in _ALLOWED_MASKS:
         return False
-    if packed is None and attention_mask is None and (
-        "padding" in mask_name or mask_name == "arbitrary"
+    if (
+        packed is None
+        and attention_mask is None
+        and ("padding" in mask_name or mask_name == "arbitrary")
     ):
         # Dense calls cannot express a padding/arbitrary mask without the
         # tensor; packed THD spans carry only valid tokens, so the padding
         # qualifier is dropped per span instead (old-code guard restored).
         return False
-    if getattr(self, "window_size", None) == (-1, 0) and "causal" not in mask_name:
+    if window is not None and tuple(window) == (-1, 0) and "causal" not in mask_name:
         return False
     return True
 
 
-def _build_meta(self, query, key, value, attention_mask, attention_bias, packed, mask_name, layout) -> _ops.AttentionMeta:
+def _build_meta(
+    self, query, key, value, attention_mask, attention_bias, packed, mask_name, layout
+) -> _ops.AttentionMeta:
     """Static metadata for the implementations (TE window encoding
     normalized here -- the first-round fix)."""
     import torch
@@ -206,7 +229,7 @@ def _build_meta(self, query, key, value, attention_mask, attention_bias, packed,
         window = None
     group = getattr(self, "cp_group", None)
     if packed is not None and getattr(packed, "cp_group", None) is not None:
-        group = getattr(packed, "cp_group")
+        group = packed.cp_group
     cp_size = 1
     if group is not None and not isinstance(group, (list, tuple)):
         cp_size = group.size()
@@ -235,7 +258,9 @@ def _build_meta(self, query, key, value, attention_mask, attention_bias, packed,
         may_require_backward=_may_require_backward(self, (query, key, value)),
         deterministic=bool(getattr(self, "deterministic", False)),
         cp_size=cp_size,
-        fp8=bool(getattr(getattr(self, "config", None), "fp8_dot_product_attention", False)),
+        fp8=bool(
+            getattr(getattr(self, "config", None), "fp8_dot_product_attention", False)
+        ),
         extra_outputs=False,
     )
 
@@ -275,17 +300,46 @@ def _original_supports(self, call) -> tuple[bool, str]:
     return _ops.IMPLEMENTATIONS["mudnn"].supports(meta)
 
 
-def _dense_dispatch(self, query, key, value, attention_mask, attn_mask_type, attention_bias, layout, original):
+def _dense_dispatch(
+    self,
+    query,
+    key,
+    value,
+    attention_mask,
+    attn_mask_type,
+    attention_bias,
+    layout,
+    original,
+):
     """Run the resolved candidate order for one dense sbhd/bshd call."""
     mask_name = _mask_type_name(attn_mask_type)
-    meta = _build_meta(self, query, key, value, attention_mask, attention_bias, None, mask_name, layout)
+    meta = _build_meta(
+        self, query, key, value, attention_mask, attention_bias, None, mask_name, layout
+    )
     selection, candidates, pre_rejections = _frozen_selection()
     if selection.policy == "upstream":
         return original(
-            self, query, key, value, attention_mask, attn_mask_type,
-            attention_bias=attention_bias, packed_seq_params=None, num_splits=None,
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=None,
+            num_splits=None,
         )
-    call = _AttentionCall(self, query, key, value, attention_mask, attn_mask_type, attention_bias, original, meta)
+    call = _AttentionCall(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type,
+        attention_bias,
+        original,
+        meta,
+    )
     return _ops.select_and_run(
         _PATCH_ID,
         candidates,
@@ -294,8 +348,15 @@ def _dense_dispatch(self, query, key, value, attention_mask, attn_mask_type, att
         call,
         original_supports=lambda c: _original_supports(self, c),
         call_original=lambda c: original(
-            c.module, c.query, c.key, c.value, c.attention_mask, c.attn_mask_type,
-            attention_bias=c.attention_bias, packed_seq_params=None, num_splits=None,
+            c.module,
+            c.query,
+            c.key,
+            c.value,
+            c.attention_mask,
+            c.attn_mask_type,
+            attention_bias=c.attention_bias,
+            packed_seq_params=None,
+            num_splits=None,
         ),
     )
 
@@ -311,10 +372,14 @@ def _packed_forward(self, query, key, value, mask_name, packed, original):
     import torch
 
     q_spans = _packed_spans(
-        packed.cu_seqlens_q, getattr(packed, "cu_seqlens_q_padded", None), query.shape[0]
+        packed.cu_seqlens_q,
+        getattr(packed, "cu_seqlens_q_padded", None),
+        query.shape[0],
     )
     k_spans = _packed_spans(
-        packed.cu_seqlens_kv, getattr(packed, "cu_seqlens_kv_padded", None), key.shape[0]
+        packed.cu_seqlens_kv,
+        getattr(packed, "cu_seqlens_kv_padded", None),
+        key.shape[0],
     )
     if len(q_spans) != len(k_spans) or key.shape[0] != value.shape[0]:
         raise ValueError("Packed query/key/value sequences must match")
@@ -324,7 +389,7 @@ def _packed_forward(self, query, key, value, mask_name, packed, original):
     if span_mask == "padding":
         span_mask = "no_mask"
     outputs = []
-    for (qs, nq, capacity), (ks, nk, _) in zip(q_spans, k_spans):
+    for (qs, nq, capacity), (ks, nk, _) in zip(q_spans, k_spans, strict=True):
         # clone() detaches the span from packed storage: TE's layout probe
         # rejects non-zero storage offsets, and .contiguous() would be a no-op.
         q, k, v = (
@@ -350,10 +415,14 @@ def _packed_forward(self, query, key, value, mask_name, packed, original):
             out = q.sum(-1, keepdim=True).expand(nq, q.shape[-2], v.shape[-1]) * 0
             out = out + (k.sum() + v.sum()) * 0
         if capacity > nq:
-            out = torch.cat((out, out.new_zeros(capacity - nq, out.shape[1], out.shape[2])))
+            out = torch.cat(
+                (out, out.new_zeros(capacity - nq, out.shape[1], out.shape[2]))
+            )
         outputs.append(out)
     # TE's THD contract flattens heads: [total, h * d].
-    return torch.cat(outputs, dim=0).reshape(query.shape[0], -1)
+    return torch.cat(outputs, dim=0).reshape(
+        query.shape[0], query.shape[-2] * value.shape[-1]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +456,27 @@ def _tedpa_forward(original: Any) -> Any:
         num_splits=None,
     ):
         packed = packed_seq_params
-        layout = getattr(packed, "qkv_format", None) or getattr(self, "qkv_format", "sbhd")
+        musa_call = getattr(getattr(query, "device", None), "type", None) == "musa"
+        selection = _frozen_selection()[0] if musa_call else None
+        if not musa_call or (selection is not None and selection.policy == "upstream"):
+            return original(
+                self,
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed,
+                num_splits=num_splits,
+            )
+        layout = getattr(packed, "qkv_format", None) or getattr(
+            self, "qkv_format", "sbhd"
+        )
         mask_name = _mask_type_name(attn_mask_type)
-        eligible = _eligible(self, query, key, value, packed, num_splits, mask_name, attention_mask)
+        eligible = _eligible(
+            self, query, key, value, packed, num_splits, mask_name, attention_mask
+        )
         if eligible and _musa_live() and query.device.type == "musa":
             if (
                 layout == "thd"
@@ -398,12 +485,32 @@ def _tedpa_forward(original: Any) -> Any:
                 and attention_mask is None
                 and attention_bias is None
             ):
-                return _packed_forward(self, query, key, value, mask_name, packed, original)
+                return _packed_forward(
+                    self, query, key, value, mask_name, packed, original
+                )
             if packed is None and layout in ("sbhd", "bshd"):
                 return _dense_dispatch(
-                    self, query, key, value, attention_mask, attn_mask_type,
-                    attention_bias, layout, original,
+                    self,
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type,
+                    attention_bias,
+                    layout,
+                    original,
                 )
+        if selection is not None and selection.policy == "force":
+            raise _ops.NoCompatibleImplementation(
+                _PATCH_ID,
+                f"layout={layout}, mask={mask_name}",
+                [
+                    (
+                        selection.implementations[0],
+                        "call is outside the supported adaptation contract",
+                    )
+                ],
+            )
         return original(
             self,
             query,
@@ -423,6 +530,11 @@ PATCHES = (
     AttrPatch(
         id=_PATCH_ID,
         target=_TARGET,
+        # Wrapper contract (TEDotProductAttention.forward with the num_splits
+        # keyword) exists from core_v0.16.0; older cores TypeError on the
+        # keyword call. The signature is unchanged through core_v0.19.0, the
+        # newest release line in the reference checkout.
+        version_gates=("megatron-core >=0.16,<0.20",),
         replace=_tedpa_forward,
         rationale=(
             "MT-TE's DotProductAttention hard-codes use_flash_attention, so "
@@ -448,7 +560,7 @@ PATCHES = (
             "empty sequences.  CP, FP8 DPA, special softmax, windowed "
             "attention and max-logit stay upstream.  Policy comes from "
             "[attention] / TRAINING_MUSA_ADAPTOR_ATTN_* / "
-            "patch_options.\"megatron.te.attention.capability-dispatch\"."
+            'patch_options."megatron.te.attention.capability-dispatch".'
         ),
         upstream=(
             "NVIDIA/Megatron-LM megatron/core/extensions/transformer_engine.py:"

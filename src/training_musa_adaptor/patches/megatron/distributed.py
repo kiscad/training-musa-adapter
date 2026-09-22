@@ -1,7 +1,4 @@
 """Best-effort process-group teardown and collective-shape adapters.
-Migrated from megatron-musa-patch ``patches/_distributed.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-
 
 Runs that leave MCCL groups live during Python finalization have exhibited
 watchdog errors and, on some stacks, aborts. An atexit callback improves the
@@ -13,7 +10,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ..._engine import AttrPatch, HookPatch
 from ...backends import musa_available as _musa_live
@@ -26,6 +24,9 @@ _teardown_callback: Callable[[], None] | None = None
 
 
 def _install_clean_teardown() -> bool | None:
+    if not _musa_live():
+        return False
+
     global _teardown_callback
     if _teardown_callback is not None:
         return False
@@ -43,6 +44,7 @@ def _install_clean_teardown() -> bool | None:
 
     atexit.register(_teardown)
     _teardown_callback = _teardown
+    return True  # applied
 
 
 def _uninstall_clean_teardown() -> None:
@@ -70,7 +72,8 @@ def _fsdp_gradient_reduce_prescale(original: Any) -> Any:
     @functools.wraps(original)
     def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
         if (
-            scaling_factor is not None
+            grad_data.device.type == "musa"
+            and scaling_factor is not None
             and not ddp_config.average_in_collective
             and ddp_config.gradient_reduce_div_fusion
             and grad_data.dtype != torch.bfloat16
@@ -83,7 +86,9 @@ def _fsdp_gradient_reduce_prescale(original: Any) -> Any:
                 grad_data.dtype,
                 scaling_factor,
             )
-            grad_data.mul_(scaling_factor)
+            # Upstream decorates this preprocessing function with no_grad.
+            with torch.no_grad():
+                grad_data.mul_(scaling_factor)
             return torch.distributed.ReduceOp.SUM
         return original(grad_data, scaling_factor, ddp_config)
 
@@ -133,6 +138,10 @@ PATCHES = (
         trigger="megatron.core.parallel_state",
         run=_install_clean_teardown,
         undo=_uninstall_clean_teardown,
+        # torch-level teardown policy; baseline is the current megatron
+        # package layout (core_v0.6.0). Verified through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.6,<0.20",),
         rationale=(
             "MUSA bring-up runs that left process groups alive at interpreter exit "
             "showed MCCL watchdog/finalization errors. The affected entry points "
@@ -140,14 +149,14 @@ PATCHES = (
         ),
         strategy=(
             "Register one best-effort atexit callback to destroy an initialized "
-            "process group, without adding a barrier. TEARDOWN=0 skips registration; "
+            "process group, without adding a barrier. Disable this patch ID to skip registration; "
             "undo unregisters only this callback and does not destroy a live group."
         ),
         upstream="pytorch/pytorch torch/distributed/distributed_c10d.py; MCCL shutdown",
         remove_when=(
             "Review on torch_musa/MCCL and launcher/Megatron upgrades; remove when "
             "the entry point owns explicit cleanup or repeated multi-rank normal "
-            "exit tests pass with TEARDOWN=0. Test failure/interrupt paths separately."
+            "exit tests pass with this patch disabled. Test failure/interrupt paths separately."
         ),
     ),
     AttrPatch(
@@ -157,6 +166,11 @@ PATCHES = (
             "megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer:"
             "gradient_reduce_preprocessing"
         ),
+        # megatron/core/distributed/fsdp/src/megatron_fsdp (with its
+        # _make_nccl_premul_sum branch, the same signature and DDP-config
+        # fields) exists from core_v0.14.0 through core_v0.19.0, the newest
+        # release line in the checkout.
+        version_gates=("megatron-core >=0.14,<0.20",),
         replace=_fsdp_gradient_reduce_prescale,
         rationale=(
             "FSDP gradient averaging with gradient_reduce_div_fusion builds a "
@@ -168,7 +182,7 @@ PATCHES = (
             "core_v0.16.1 in distributed/megatron_fsdp tests."
         ),
         strategy=(
-            "Intercept exactly the PREMUL_SUM branch (scaling_factor is not None, "
+            "For MUSA gradients intercept exactly the PREMUL_SUM branch (scaling_factor is not None, "
             "average_in_collective off, gradient_reduce_div_fusion on, dtype not "
             "bf16): multiply the gradient buffer in place on the current stream -- "
             "the caller issues its reduce-scatter/all-reduce on the same buffer "
@@ -191,6 +205,11 @@ PATCHES = (
         id="megatron.bridge-communicator.subgroups-backend",
         rebind_prefixes=("megatron",),
         target="megatron.core.pipeline_parallel.bridge_communicator:dist",
+        # megatron/core/pipeline_parallel/bridge_communicator.py (with its
+        # new_subgroups_by_enumeration call and module-level dist global)
+        # exists from core_v0.15.0, unchanged through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.15,<0.20",),
         replace=_subgroups_distributed_proxy,
         rationale=(
             "The bridge communicator creates its boundary broadcast subgroups "
@@ -226,6 +245,11 @@ PATCHES = (
         id="megatron.hyper-comm-grid.subgroups-backend",
         rebind_prefixes=("megatron",),
         target="megatron.core.hyper_comm_grid:dist",
+        # megatron/core/hyper_comm_grid.py (with its
+        # new_subgroups_by_enumeration call and module-level dist global)
+        # exists from core_v0.14.0, unchanged through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.14,<0.20",),
         replace=_subgroups_distributed_proxy,
         rationale=(
             "HyperCommGrid creates its process groups with "

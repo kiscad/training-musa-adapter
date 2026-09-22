@@ -1,7 +1,4 @@
 """Fused-softmax availability that tells the truth about the CUDA extension.
-Migrated from megatron-musa-patch ``patches/_softmax.py`` (rev a1090de).
-The retired per-patch env switch maps to ONLY/DISABLE on the patch IDs.
-
 
 ``FusedScaleMaskSoftmax.is_kernel_available`` reaches ``get_batch_per_block``,
 which imports the ``scaled_masked_softmax_cuda`` extension at call time. On the
@@ -19,8 +16,6 @@ from ..._engine import AttrPatch
 
 __all__ = ["PATCHES"]
 
-import logging as _logging
-_compat_logger_shim = _logging.getLogger("training_musa_adaptor")
 
 _SOFTMAX_EXTENSION = "scaled_masked_softmax_cuda"
 
@@ -28,16 +23,14 @@ _SOFTMAX_EXTENSION = "scaled_masked_softmax_cuda"
 def _softmax_kernel_available(original: Any) -> Any:
     """Return False when the fused CUDA extension is absent."""
 
+    import importlib.util
+
+    if importlib.util.find_spec(_SOFTMAX_EXTENSION) is not None:
+        return None  # Keep the upstream probe when its extension exists.
+
     @functools.wraps(original)
     def is_kernel_available(self, mask, b, np, sq, sk):
-        import importlib.util
-
-        if importlib.util.find_spec(_SOFTMAX_EXTENSION) is None:
-            # The extension cannot be imported: upstream's torch fallback is
-            # the correct path. Do not reach get_batch_per_block(), which
-            # imports the extension and raises ModuleNotFoundError.
-            return False
-        return original(self, mask, b, np, sq, sk)
+        return False
 
     return is_kernel_available
 
@@ -46,7 +39,14 @@ PATCHES = (
     AttrPatch(
         id="megatron.softmax.kernel-availability.musa",
         rebind_prefixes=("megatron",),
-        target=("megatron.core.fusions.fused_softmax:FusedScaleMaskSoftmax." "is_kernel_available"),
+        target=(
+            "megatron.core.fusions.fused_softmax:FusedScaleMaskSoftmax."
+            "is_kernel_available"
+        ),
+        # FusedScaleMaskSoftmax.is_kernel_available and the get_batch_per_block
+        # probe exist unchanged from core_v0.4.0 through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.4,<0.20",),
         replace=_softmax_kernel_available,
         rationale=(
             "Upcycling with the local spec constructs FusedScaleMaskSoftmax; its "
@@ -57,7 +57,7 @@ PATCHES = (
             "(test_upcycling_Local[tp_ep0-1-False-False-False])."
         ),
         strategy=(
-            "Before delegating, check whether the extension is even importable "
+            "At installation, check whether the extension is importable "
             "with importlib.util.find_spec (which locates without executing the "
             "module) and return False when it is absent, so upstream's own "
             "forward_torch_softmax path runs with its scale/mask/fp32-softmax "

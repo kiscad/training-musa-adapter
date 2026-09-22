@@ -1,12 +1,9 @@
 """Synthetic NVIDIA-scale values for Megatron's architecture comparisons.
-Migrated from megatron-musa-patch ``patches/_device_arch.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-
 
 MUSA capability numbers are not NVIDIA compute capabilities. The default 8.3
 passes Megatron's >=8 grouped-GEMM gate and stays below its >=10 architecture
 checks. It neither describes real hardware nor proves that a gated kernel is
-supported. In particular, overriding ARCH can enable additional NVIDIA paths.
+supported. The claim is fixed; exposing new NVIDIA paths requires separate validation.
 The torch.cuda override is process-wide once Megatron triggers it; undo restores
 it only while we still own the attribute. Real MUSA capability queries should
 use the backend's native API.
@@ -15,10 +12,10 @@ use the backend's native API.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from ..._engine import AttrPatch, HookPatch
+from ...backends import musa_available
 
 __all__ = ["PATCHES", "arch_tuple", "arch_major"]
 
@@ -30,11 +27,9 @@ _capability_override: tuple[Any, Any, Any] | None = None
 
 
 def arch_tuple() -> tuple[int, int]:
-    """The ARCH env knob is retired in v2.0: the verified capability claim
-    for this stack is fixed at the default. A different claim is a new
+    """The verified capability claim for this stack is fixed at the default. A different claim is a new
     patch revision with its own evidence, not a deployment knob."""
     return _DEFAULT_ARCH
-
 
 
 def arch_major() -> int:
@@ -43,7 +38,7 @@ def arch_major() -> int:
 
 def _install_torch_capability() -> bool | None:
     global _capability_override
-    if _capability_override is not None:
+    if _capability_override is not None or not musa_available():
         return False
 
     import torch
@@ -76,6 +71,8 @@ def _uninstall_torch_capability() -> None:
 
 
 def _replace_arch_version(original: Any) -> Any:
+    if not musa_available():
+        return None
     major = arch_major()
 
     def get_device_arch_version():
@@ -90,14 +87,19 @@ PATCHES = (
         trigger="megatron.core.parallel_state",
         run=_install_torch_capability,
         undo=_uninstall_torch_capability,
+        # torch-level policy; the megatron consumer (the NVIDIA capability
+        # gate in megatron/training/arguments.py, current package layout)
+        # exists from core_v0.6.0 and is unchanged through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.6,<0.20",),
         rationale=(
             "Megatron arguments.py compares torch.cuda.get_device_capability "
             "against NVIDIA's >=8 grouped-GEMM threshold; MUSA's native numbering "
             "is not comparable. A numeric gate is not a backend kernel probe."
         ),
         strategy=(
-            "On Megatron import substitute the configurable NVIDIA-scale pair "
-            "(default 8.3) on torch.cuda only; record ownership for reversible undo. "
+            "On Megatron import with a live MUSA runtime substitute the fixed "
+            "NVIDIA-scale pair (8.3) on torch.cuda only; record ownership for reversible undo. "
             "This is a process-wide policy, not a claim of Ampere compatibility."
         ),
         upstream=(
@@ -114,6 +116,11 @@ PATCHES = (
         id="megatron.training.get-device-arch-version.nvidia-scale",
         rebind_prefixes=("megatron",),
         target="megatron.training.utils:get_device_arch_version",
+        # The helper exists from core_v0.12.0. core_v0.18.0 turns
+        # megatron/training/utils into a package whose __init__ re-exports it
+        # with the same contract, so the target still resolves there
+        # (verified through core_v0.19.0, the newest release line).
+        version_gates=("megatron-core >=0.12,<0.20",),
         replace=_replace_arch_version,
         rationale=(
             "The upstream helper reads CUDA device properties.major and documents "

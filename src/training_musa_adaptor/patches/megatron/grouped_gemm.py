@@ -1,7 +1,4 @@
 """Device-side grouped GEMM reference for MUSA.
-Migrated from megatron-musa-patch ``patches/_grouped_gemm.py`` (rev a1090de).
-The retired per-patch env switch maps to ONLY/DISABLE on the patch IDs.
-
 
 The upstream MoE grouped-GEMM path requires the fanshiqing ``grouped_gemm``
 CUDA extension, which has no MUSA build. This module provides a reference
@@ -20,10 +17,8 @@ from ..._engine import AttrPatch
 
 __all__ = ["PATCHES"]
 
-import logging as _logging
-_compat_logger_shim = _logging.getLogger("training_musa_adaptor")
 
-logger = logging.getLogger("megatron_musa_patch")
+logger = logging.getLogger("training_musa_adaptor")
 
 _UTIL = "megatron.core.transformer.moe.grouped_gemm_util"
 
@@ -52,20 +47,27 @@ def gmm(a, b, tokens_per_expert, trans_b=False):
     import torch
 
     if a.ndim != 2 or b.ndim != 3:
-        raise ValueError("gmm expects a [tokens, K] and b [experts, K, N] (or [experts, N, K])")
+        raise ValueError(
+            "gmm expects a [tokens, K] and b [experts, K, N] (or [experts, N, K])"
+        )
     if tokens_per_expert.ndim != 1 or tokens_per_expert.numel() != b.size(0):
         raise ValueError("tokens_per_expert must contain one count per expert")
     counts = tokens_per_expert.tolist()
     if any(not isinstance(count, int) or count < 0 for count in counts):
         raise ValueError("tokens_per_expert must contain nonnegative integer counts")
     if sum(counts) != a.size(0):
-        raise ValueError(f"tokens_per_expert sums to {sum(counts)} but a has {a.size(0)} rows")
+        raise ValueError(
+            f"tokens_per_expert sums to {sum(counts)} but a has {a.size(0)} rows"
+        )
     if trans_b:
         b = b.transpose(-2, -1)
     if not counts:
         # Even the zero-expert case retains both autograd edges.
         return torch.matmul(a, b.sum(dim=0))
-    outputs = [torch.matmul(chunk, weight) for chunk, weight in zip(a.split(counts), b)]
+    outputs = [
+        torch.matmul(chunk, weight)
+        for chunk, weight in zip(a.split(counts), b, strict=True)
+    ]
     return torch.cat(outputs, dim=0)
 
 
@@ -159,7 +161,14 @@ PATCHES = (
         id="transformer_engine.grouped-gemm.wgrad-reference",
         target="transformer_engine.pytorch.cpp_extensions.gemm:general_grouped_gemm",
         rebind_prefixes=("transformer_engine",),
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TE-side target; its megatron-side consumers (GroupedMLP/TEGroupedLinear
+        # offload flows) are present through core_v0.19.0, the newest release
+        # line in the checkout. MT-TE 2.0 is the fork with the broken grouped
+        # NT+bgrad kernel.
+        version_gates=(
+            "megatron-core >=0.16,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         replace=_te_grouped_wgrad,
         rationale="MT-TE plain grouped NT weight-gradient GEMM with bias fails RunLt in offloading tests.",
         strategy=(
@@ -175,6 +184,12 @@ PATCHES = (
         id="megatron.moe.grouped-gemm.torch-ops",
         rebind_prefixes=("megatron",),
         target=f"{_UTIL}:ops",
+        # megatron/core/transformer/moe/grouped_gemm_util.py (ops,
+        # grouped_gemm_is_available, assert_grouped_gemm_is_available) exists
+        # from core_v0.5.0 and is removed in core_v0.17.0, which reworks
+        # grouped-GEMM backend selection (inference_grouped_gemm_backend):
+        # there is nothing to patch beyond that line.
+        version_gates=("megatron-core >=0.5,<0.17",),
         replace=_grouped_gemm_ops,
         rationale=(
             "GroupedMLP builds through gg.assert_grouped_gemm_is_available() and "
@@ -208,6 +223,9 @@ PATCHES = (
         id="megatron.moe.grouped-gemm.available-flag",
         rebind_prefixes=("megatron",),
         target=f"{_UTIL}:grouped_gemm_is_available",
+        # Same grouped_gemm_util envelope as the torch-ops fallback
+        # (core_v0.5.0 through core_v0.16.x).
+        version_gates=("megatron-core >=0.5,<0.17",),
         replace=_grouped_gemm_is_available,
         requires=("megatron.moe.grouped-gemm.torch-ops",),
         rationale=(
@@ -231,6 +249,9 @@ PATCHES = (
         id="megatron.moe.grouped-gemm.assert-noop",
         rebind_prefixes=("megatron",),
         target=f"{_UTIL}:assert_grouped_gemm_is_available",
+        # Same grouped_gemm_util envelope as the torch-ops fallback
+        # (core_v0.5.0 through core_v0.16.x).
+        version_gates=("megatron-core >=0.5,<0.17",),
         replace=_assert_grouped_gemm_is_available,
         requires=("megatron.moe.grouped-gemm.torch-ops",),
         rationale=(

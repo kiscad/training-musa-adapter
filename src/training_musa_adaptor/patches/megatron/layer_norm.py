@@ -1,11 +1,5 @@
 """PyTorch normalization fallback for the affected apex/TE integration.
 
-Migrated from megatron-musa-patch ``patches/_layer_norm.py`` (rev a1090de).
-The retired per-patch env switches map to ONLY/DISABLE on the patch IDs:
-``TE_FUSED_LAYERNORM=1``/``TE_NORM=1``/``BLOCK_LAYERNORM=upstream`` meant
-"decline this patch", which v2.0 expresses as
-``TRAINING_MUSA_ADAPTOR_DISABLE=<patch id>``.
-
 An importable apex package does not establish that its fused_layer_norm_cuda
 extension can run on MUSA. The block-level TE norm also hit an allocateSpace
 assertion in the bring-up stack. These are version-specific failures, not a
@@ -69,7 +63,7 @@ def _build_norm_fallback_class(base: Any = None, cast_to_input: bool = False) ->
         models. Legacy constructor keywords remain accepted for compatibility.
         """
 
-        _megatron_musa_patch_fallback = True
+        _tma_fallback = True
         _cast_output_to_input = cast_to_input
 
         def __init__(
@@ -125,21 +119,28 @@ def _build_norm_fallback_class(base: Any = None, cast_to_input: bool = False) ->
                 weight = weight.to(input.dtype)  # type: ignore[assignment]
                 bias = bias.to(input.dtype) if bias is not None else None  # type: ignore[assignment]
             if self.normalization == "RMSNorm":
-                return torch.nn.functional.rms_norm(input, self.hidden_size, weight, self.eps)
-            return torch.nn.functional.layer_norm(input, self.hidden_size, weight, bias, self.eps)
+                return torch.nn.functional.rms_norm(
+                    input, self.hidden_size, weight, self.eps
+                )
+            return torch.nn.functional.layer_norm(
+                input, self.hidden_size, weight, bias, self.eps
+            )
 
     return FusedLayerNorm
 
 
 def _pure_torch_layer_norm(original: Any) -> Any:
     """Build a fallback without importing torch until the target is available."""
+    if not _musa_live():
+        return None
+
     return _build_norm_fallback_class()
 
 
 def _using_torch_fallback() -> bool:
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
-    return bool(getattr(FusedLayerNorm, "_megatron_musa_patch_fallback", False))
+    return bool(getattr(FusedLayerNorm, "_tma_fallback", False))
 
 
 def _fallback_available_flag(original: Any) -> Any:
@@ -154,9 +155,12 @@ def _persistent_available_flag(original: Any) -> Any:
 
 def _block_layer_norm_impl(original: Any) -> Any:
     """Use a functional norm even when the separate local-class patch is off."""
+    if not _musa_live():
+        return None
+
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
-    if getattr(FusedLayerNorm, "_megatron_musa_patch_fallback", False):
+    if getattr(FusedLayerNorm, "_tma_fallback", False):
         return FusedLayerNorm
     return _pure_torch_layer_norm(FusedLayerNorm)
 
@@ -167,6 +171,9 @@ def _unfused_te_layer_norm_linear(original: Any) -> Any:
     Register norm parameters on the linear itself to retain the fused module's
     checkpoint names and replicated (rather than column-sharded) norm weights.
     """
+    if not _musa_live():
+        return None
+
     from megatron.core.extensions.transformer_engine import HAVE_TE
 
     # Megatron uses MagicMock-backed placeholders when TE imports fail. They
@@ -190,7 +197,9 @@ def _unfused_te_layer_norm_linear(original: Any) -> Any:
     try:
         import transformer_engine as _te
 
-        te_layernorm_linear = getattr(getattr(_te, "pytorch", None), "LayerNormLinear", None)
+        te_layernorm_linear = getattr(
+            getattr(_te, "pytorch", None), "LayerNormLinear", None
+        )
     except Exception:  # noqa: BLE001 - stubbed or broken TE skips registration
         te_layernorm_linear = None
 
@@ -203,7 +212,7 @@ def _unfused_te_layer_norm_linear(original: Any) -> Any:
     class TELayerNormColumnParallelLinear(
         TEColumnParallelLinear, metaclass=_NormLinearDispatchMeta
     ):
-        _megatron_musa_patch_fallback = True
+        _tma_fallback = True
 
         def __new__(cls, *args, **kwargs):
             # Dispatch once at construction. Returning the original instance
@@ -228,7 +237,9 @@ def _unfused_te_layer_norm_linear(original: Any) -> Any:
 
         def __init__(self, input_size, output_size, *, config, **kwargs):
             if kwargs.get("is_expert", False):
-                raise ValueError("Transformer Engine norm-linear layers do not support MoE")
+                raise ValueError(
+                    "Transformer Engine norm-linear layers do not support MoE"
+                )
             if config.normalization not in ("LayerNorm", "RMSNorm"):
                 raise ValueError(f"Unsupported normalization: {config.normalization!r}")
             super().__init__(input_size, output_size, config=config, **kwargs)
@@ -277,7 +288,9 @@ def _unfused_te_layer_norm_linear(original: Any) -> Any:
                 bias = bias.to(dtype)
             weight = weight + 1 if self.zero_centered_gamma else weight
             if self.normalization == "RMSNorm":
-                normalized = torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, self.eps)
+                normalized = torch.nn.functional.rms_norm(
+                    x, (x.shape[-1],), weight, self.eps
+                )
             else:
                 normalized = torch.nn.functional.layer_norm(
                     x,
@@ -297,7 +310,9 @@ def _unfused_te_layer_norm_linear(original: Any) -> Any:
     # consumers may rebind).
     _BASE_NORM_LINEAR = TELayerNormColumnParallelLinear
 
-    if isinstance(te_layernorm_linear, type) and hasattr(te_layernorm_linear, "register"):
+    if isinstance(te_layernorm_linear, type) and hasattr(
+        te_layernorm_linear, "register"
+    ):
         te_layernorm_linear.register(TELayerNormColumnParallelLinear)
 
     return TELayerNormColumnParallelLinear
@@ -380,7 +395,9 @@ def _te_plain_weight(self, name_base, activation_dtype):
 
     import torch
 
-    quantized = getattr(sys.modules.get("transformer_engine.pytorch.tensor"), "QuantizedTensor", ())
+    quantized = getattr(
+        sys.modules.get("transformer_engine.pytorch.tensor"), "QuantizedTensor", ()
+    )
     tensors = [getattr(self, name) for name in getattr(self, f"{name_base}_names")]
     tensors = [t.dequantize() if isinstance(t, quantized) else t for t in tensors]
     weight = tensors[0] if len(tensors) == 1 else torch.cat(tensors)
@@ -419,12 +436,15 @@ def _unfused_te_native_layernorm_linear(original: Any) -> Any:
         return None
 
     class LayerNormLinearUnfused(original):  # type: ignore[misc,valid-type]
-        _megatron_musa_patch_fallback = True
+        _tma_fallback = True
 
         def forward(self, inp, is_first_microbatch=None, fp8_output=False):
             if fp8_output or not _te_native_module_eligible(self, inp):
                 return original.forward(
-                    self, inp, is_first_microbatch=is_first_microbatch, fp8_output=fp8_output
+                    self,
+                    inp,
+                    is_first_microbatch=is_first_microbatch,
+                    fp8_output=fp8_output,
                 )
             import torch.nn.functional as F
 
@@ -435,7 +455,9 @@ def _unfused_te_native_layernorm_linear(original: Any) -> Any:
                 weight = _te_plain_weight(self, "weight", self.activation_dtype)
                 bias_tensor = _te_plain_bias(self, self.activation_dtype)
                 gemm_bias = (
-                    bias_tensor if self.apply_bias and not self.gemm_bias_unfused_add else None
+                    bias_tensor
+                    if self.apply_bias and not self.gemm_bias_unfused_add
+                    else None
                 )
                 out = F.linear(ln_out, weight, gemm_bias)
             if self.gemm_bias_unfused_add:
@@ -458,13 +480,17 @@ def _unfused_te_native_layernorm_mlp(original: Any) -> Any:
         return None
 
     class LayerNormMLPUnfused(original):  # type: ignore[misc,valid-type]
-        _megatron_musa_patch_fallback = True
+        _tma_fallback = True
 
         def forward(self, inp, is_first_microbatch=None):
             if not _te_native_module_eligible(self, inp):
-                return original.forward(self, inp, is_first_microbatch=is_first_microbatch)
+                return original.forward(
+                    self, inp, is_first_microbatch=is_first_microbatch
+                )
             if self.activation not in ("gelu", "relu"):
-                return original.forward(self, inp, is_first_microbatch=is_first_microbatch)
+                return original.forward(
+                    self, inp, is_first_microbatch=is_first_microbatch
+                )
             import torch.nn.functional as F
 
             with self.prepare_forward(inp, num_gemms=2) as x:
@@ -491,7 +517,9 @@ def _unfused_te_native_layernorm_mlp(original: Any) -> Any:
                 else:
                     act_out = F.relu(fc1_out)
                 gemm2_bias = (
-                    fc2_bias if self.apply_bias and not self.gemm_bias_unfused_add else None
+                    fc2_bias
+                    if self.apply_bias and not self.gemm_bias_unfused_add
+                    else None
                 )
                 out = F.linear(act_out, fc2_weight, gemm2_bias)
             if self.gemm_bias_unfused_add:
@@ -519,7 +547,7 @@ def _unfused_te_fused_mlp(original: Any) -> Any:
     from megatron.core.transformer.mlp import MLP
 
     class TEFusedMLPUnfused(original):  # type: ignore[misc,valid-type]
-        _megatron_musa_patch_fallback = True
+        _tma_fallback = True
 
         def forward(self, hidden_states, **kwargs):
             config = getattr(self, "config", None)
@@ -529,7 +557,10 @@ def _unfused_te_fused_mlp(original: Any) -> Any:
                 return original.forward(self, hidden_states, **kwargs)
             import torch
 
-            if not torch.is_tensor(hidden_states) or hidden_states.device.type != "musa":
+            if (
+                not torch.is_tensor(hidden_states)
+                or hidden_states.device.type != "musa"
+            ):
                 return original.forward(self, hidden_states, **kwargs)
             return MLP.forward(self, hidden_states, **kwargs)
 
@@ -548,7 +579,7 @@ def _te_norm_unfused(original: Any) -> Any:
     contract matches TE's ``op_forward``: the compute dtype is the autocast
     dtype when autocast is active and the parameter dtype otherwise, and the
     *input* is cast to it (never the reverse), so mixed-dtype activations are
-    absorbed exactly like the native kernel. TE_NORM=1 keeps upstream for
+    absorbed exactly like the native kernel. Disable this patch ID for
     upgrade validation.
     """
     import sys
@@ -571,7 +602,7 @@ def _te_norm_unfused(original: Any) -> Any:
 
     def build(te_cls, normalization):
         class TENormFallback(te_cls):  # type: ignore[valid-type,misc]
-            _megatron_musa_patch_fallback = True
+            _tma_fallback = True
 
             def __init__(self, config, hidden_size, eps=1e-5):
                 te_cls.__init__(
@@ -609,7 +640,9 @@ def _te_norm_unfused(original: Any) -> Any:
                     return torch.nn.functional.layer_norm(
                         input, self.hidden_size, weight, bias, self.eps
                     )
-                return torch.nn.functional.rms_norm(input, self.hidden_size, weight, self.eps)
+                return torch.nn.functional.rms_norm(
+                    input, self.hidden_size, weight, self.eps
+                )
 
         TENormFallback.__name__ = f"TENorm{normalization}Fallback"
         return TENormFallback
@@ -620,7 +653,7 @@ def _te_norm_unfused(original: Any) -> Any:
     class TENormMusa:
         """Drop-in for upstream's TENorm conditional wrapper."""
 
-        _megatron_musa_patch_fallback = True
+        _tma_fallback = True
 
         def __new__(cls, config, hidden_size, eps: float = 1e-5):
             normalization = getattr(config, "normalization", "LayerNorm")
@@ -639,7 +672,13 @@ def _te_norm_unfused(original: Any) -> Any:
 PATCHES = (
     AttrPatch(
         id="transformer_engine.layer-norm-linear.native-unfused",
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TE-side target; the megatron envelope is the 0.16.x+ line where its
+        # consumers live (megatron-FSDP te_transformer, core_v0.14.0+,
+        # present through core_v0.19.0, the newest release line).
+        version_gates=(
+            "megatron-core >=0.16,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         target="transformer_engine.pytorch.module.layernorm_linear:LayerNormLinear",
         rebind_prefixes=("transformer_engine",),
         replace=_unfused_te_native_layernorm_linear,
@@ -663,8 +702,8 @@ PATCHES = (
             "ops, bypassing the fused kernel and its custom autograd node. "
             "The norm follows TE's dtype contract (input cast to the "
             "activation/parameter dtype). Everything else calls the original "
-            "forward so its own errors surface. TE_FUSED_LAYERNORM=1 "
-            "restores upstream for upgrade validation."
+            "forward so its own errors surface. Disable this patch ID "
+            "to restore upstream for upgrade validation."
         ),
         upstream=(
             "TransformerEngine pytorch/module/layernorm_linear.py:"
@@ -679,7 +718,12 @@ PATCHES = (
     ),
     AttrPatch(
         id="transformer_engine.layer-norm-mlp.native-unfused",
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TE-side target; same megatron envelope as the LayerNormLinear
+        # replacement (verified through core_v0.19.0).
+        version_gates=(
+            "megatron-core >=0.16,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         target="transformer_engine.pytorch.module.layernorm_mlp:LayerNormMLP",
         rebind_prefixes=("transformer_engine",),
         replace=_unfused_te_native_layernorm_mlp,
@@ -695,7 +739,7 @@ PATCHES = (
             "path is functional norm -> fc1 -> gelu(tanh, matching tex.gelu) "
             "or relu -> fc2 on plain PyTorch ops. Gated activations and "
             "every non-plain configuration keep the original forward so "
-            "their own errors surface. TE_FUSED_LAYERNORM=1 restores "
+            "their own errors surface. Disable this patch ID to restore "
             "upstream for upgrade validation."
         ),
         upstream=(
@@ -712,7 +756,14 @@ PATCHES = (
     AttrPatch(
         id="megatron.te.layer-norm-linear.unfused",
         rebind_prefixes=("megatron",),
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TELayerNormColumnParallelLinear exists from core_v0.9.0 with the
+        # same (input_size, output_size, *, config) constructor through
+        # core_v0.19.0; MT-TE 2.0
+        # is the fork with the aborting fused norm-linear kernel.
+        version_gates=(
+            "megatron-core >=0.9,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         target="megatron.core.extensions.transformer_engine:TELayerNormColumnParallelLinear",
         replace=_unfused_te_layer_norm_linear,
         rationale=(
@@ -733,7 +784,7 @@ PATCHES = (
             "run their own constructor (the fused signature cannot accept their "
             "(config, tp_comm_buffer_name) call shape) and this class then honors the config's "
             "RMSNorm, matching the fused module's no-bias parameter layout. "
-            "TE_FUSED_LAYERNORM=1 restores upstream for upgrade validation."
+            "Disable this patch ID to restore upstream for upgrade validation."
         ),
         upstream="NVIDIA/Megatron-LM megatron/core/extensions/transformer_engine.py",
         remove_when=(
@@ -746,6 +797,10 @@ PATCHES = (
         id="megatron.fusions.fused-layer-norm.pure-torch",
         rebind_prefixes=("megatron",),
         target="megatron.core.fusions.fused_layer_norm:FusedLayerNorm",
+        # FusedLayerNorm (same config-first constructor contract) and the
+        # availability flags exist from core_v0.4.0, unchanged through
+        # core_v0.19.0, the newest release line in the checkout.
+        version_gates=("megatron-core >=0.4,<0.20",),
         replace=_pure_torch_layer_norm,
         rationale=(
             "In the affected stack apex imports but its fused_layer_norm_cuda "
@@ -770,6 +825,9 @@ PATCHES = (
         rebind_prefixes=("megatron",),
         requires=("megatron.fusions.fused-layer-norm.pure-torch",),
         target="megatron.core.fusions.fused_layer_norm:HAVE_FUSED_LAYER_NORM",
+        # Same fused_layer_norm envelope as the pure-torch class replacement
+        # (the flag exists from core_v0.4.0).
+        version_gates=("megatron-core >=0.4,<0.20",),
         replace=_fallback_available_flag,
         rationale=(
             "Consumers such as bert_lm_head use HAVE_FUSED_LAYER_NORM to decide "
@@ -791,6 +849,9 @@ PATCHES = (
         rebind_prefixes=("megatron",),
         requires=("megatron.fusions.fused-layer-norm.pure-torch",),
         target="megatron.core.fusions.fused_layer_norm:HAVE_PERSIST_LAYER_NORM",
+        # Same fused_layer_norm envelope as the pure-torch class replacement
+        # (the flag exists from core_v0.4.0).
+        version_gates=("megatron-core >=0.4,<0.20",),
         replace=_persistent_available_flag,
         rationale=(
             "The functional fallback does not execute apex's FastLayerNormFN; "
@@ -809,8 +870,14 @@ PATCHES = (
     AttrPatch(
         id="megatron.transformer-block.layer-norm.impl-local",
         rebind_prefixes=("megatron",),
-        version_gates=("transformer_engine >=2.0,<2.1",),
         target="megatron.core.transformer.transformer_block:LayerNormImpl",
+        # transformer_block.LayerNormImpl exists from core_v0.8.0 (still a
+        # module-level name at core_v0.19.0); MT-TE 2.0 is the fork whose
+        # TENorm aborts on MUSA.
+        version_gates=(
+            "megatron-core >=0.8,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         replace=_block_layer_norm_impl,
         rationale=(
             "TransformerBlock chooses TENorm whenever TE imports, including for "
@@ -820,20 +887,25 @@ PATCHES = (
         strategy=(
             "Bind the block's default norm to a functional fallback, reusing the "
             "patched local class when present but not requiring its patch. Explicit "
-            "block submodule specs are unchanged; BLOCK_LAYERNORM=upstream keeps "
+            "block submodule specs are unchanged; disabling this patch ID keeps "
             "the upstream default for upgrade testing."
         ),
         upstream="NVIDIA/Megatron-LM megatron/core/transformer/transformer_block.py",
         remove_when=(
             "Review on MT-TransformerEngine/torch_musa and Megatron upgrades; remove "
-            "after BLOCK_LAYERNORM=upstream passes LayerNorm and RMSNorm final-block "
+            "after the unpatched path passes LayerNorm and RMSNorm final-block "
             "forward/backward, checkpoint and multi-rank sequence-parallel tests."
         ),
     ),
     AttrPatch(
         id="megatron.te.norm.unfused-musa",
         rebind_prefixes=("megatron",),
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TENorm exists from core_v0.9.0, unchanged through core_v0.19.0;
+        # MT-TE 2.0 is the fork whose standalone norm op aborts on MUSA.
+        version_gates=(
+            "megatron-core >=0.9,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         target="megatron.core.extensions.transformer_engine:TENorm",
         replace=_te_norm_unfused,
         rationale=(
@@ -857,7 +929,7 @@ PATCHES = (
             "absorbed exactly like the native kernel instead of leaking to the "
             "next TE linear. Upstream validation for unsupported normalization "
             "values is retained. Only declines (keeping upstream) when TE is "
-            "absent, no MUSA runtime is live, or TE_NORM=1 requests the "
+            "absent or no MUSA runtime is live. Disable this patch ID for the "
             "upgrade-validation path."
         ),
         upstream=(
@@ -868,13 +940,19 @@ PATCHES = (
             "Remove after the MUSA TransformerEngine standalone LayerNorm/RMSNorm "
             "passes forward/backward, zero-centered gamma, meta materialization, "
             "checkpoint key/sharding and multi-rank sequence-parallel tests; "
-            "re-run the 44 affected node ids with TE_NORM=1 before deleting."
+            "re-run the 44 affected node ids with this patch disabled before deleting."
         ),
     ),
     AttrPatch(
         id="megatron.te.fused-mlp.unfused",
         rebind_prefixes=("megatron",),
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TEFusedMLP (the use_te_fused_ops spec) exists from core_v0.13.0
+        # (still a module-level class under its TE version guard at
+        # core_v0.19.0); MT-TE 2.0 is the fork whose ops fuser aborts on MUSA.
+        version_gates=(
+            "megatron-core >=0.13,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         target="megatron.core.extensions.transformer_engine:TEFusedMLP",
         replace=_unfused_te_fused_mlp,
         rationale=(
@@ -891,7 +969,7 @@ PATCHES = (
             "norm-linear replacement handles normalization), the functional "
             "activation, then linear_fc2. FP8 and non-MUSA inputs keep the "
             "original fused forward so quantization semantics and its own "
-            "errors surface. TE_FUSED_LAYERNORM=1 restores upstream."
+            "errors surface. Disable this patch ID to restore upstream."
         ),
         upstream=(
             "NVIDIA/Megatron-LM megatron/core/extensions/transformer_engine.py:"

@@ -1,7 +1,4 @@
 """Repair DCP CPU staging and avoid Megatron bucket-worker forks.
-Migrated from megatron-musa-patch ``patches/_checkpointing.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-
 
 DCP's CUDA availability probe sees the emulated API rather than the tensor's
 actual MUSA device. Correct its local device selection so the existing loader
@@ -26,6 +23,7 @@ from functools import wraps
 from typing import Any
 
 from ..._engine import AttrPatch, HookPatch
+from ...backends import musa_available
 
 __all__ = ["PATCHES"]
 
@@ -40,7 +38,12 @@ def _install_dcp_device() -> bool:
 
     torch = sys.modules.get("torch")
     musa = getattr(torch, "musa", None)
-    if _dcp_device_owned is not None or torch is None or musa is None or not musa.is_available():
+    if (
+        _dcp_device_owned is not None
+        or torch is None
+        or musa is None
+        or not musa.is_available()
+    ):
         return False
     filesystem = importlib.import_module("torch.distributed.checkpoint.filesystem")
     original = getattr(filesystem, "_get_available_device_type", None)
@@ -82,7 +85,7 @@ class _ImmediateQueue:
 
     def get(self) -> Any:
         if not self._items:
-            raise RuntimeError("megatron-musa-patch: result queue is empty")
+            raise RuntimeError("training-musa-adaptor: result queue is empty")
         return self._items.popleft()
 
 
@@ -97,7 +100,7 @@ class _Counter:
 
     def get(self) -> bool:
         if self._count <= 0:
-            raise RuntimeError("megatron-musa-patch: count queue underflow")
+            raise RuntimeError("training-musa-adaptor: count queue underflow")
         self._count -= 1
         return True
 
@@ -107,6 +110,9 @@ class _Counter:
 
 def _serial_writer(original: Any) -> Any:
     """Sequential replacement for ``write_preloaded_data_multiproc``."""
+    if not musa_available():
+        return None
+
     @wraps(original)
     def write_preloaded_data_serial(
         transform_list, use_msc, rank, write_buckets, global_results_queue
@@ -120,7 +126,7 @@ def _serial_writer(original: Any) -> Any:
 
         logger = logging.getLogger(__name__)
         logger.debug(
-            "megatron-musa-patch: writing %d checkpoint bucket(s) without forking",
+            "training-musa-adaptor: writing %d checkpoint bucket(s) without forking",
             len(write_buckets),
         )
 
@@ -167,7 +173,9 @@ def _serial_writer(original: Any) -> Any:
                     )
                 write_results_or_exc[idx] = result  # type: ignore[index]
             except Exception as exc:  # noqa: BLE001 - report upstream's failure payload
-                logger.error("megatron-musa-patch: bucket %d failed: %s", local_proc_idx, exc)
+                logger.error(
+                    "training-musa-adaptor: bucket %d failed: %s", local_proc_idx, exc
+                )
                 write_results_or_exc = exc
                 break
 
@@ -185,6 +193,11 @@ PATCHES = (
         trigger="megatron.core.parallel_state",
         run=_install_dcp_device,
         undo=_uninstall_dcp_device,
+        # Megatron's dist-checkpointing machinery (the DCP consumer whose CPU
+        # staging this hook corrects) exists from core_v0.6.0 and is unchanged
+        # through core_v0.19.0, the newest release line in the reference
+        # checkout.
+        version_gates=("megatron-core >=0.6,<0.20",),
         rationale=(
             "With CUDA API emulation, torch 2.7 DCP selects cuda while tensor devices "
             "remain musa. _OverlappingCpuLoader skips the CPU copy and the writer "
@@ -210,6 +223,13 @@ PATCHES = (
             "megatron.core.dist_checkpointing.strategies.filesystem_async:"
             "FileSystemWriterAsync.write_preloaded_data_multiproc"
         ),
+        # The symbol exists from core_v0.6.0, but the (transform_list, use_msc,
+        # rank, ...) signature this serial writer mirrors only from
+        # core_v0.13.0. core_v0.17.0 replaces it with
+        # write_preloaded_data_multithread (threads, not processes), which
+        # removes the fork hazard this patch works around -- nothing to adapt
+        # beyond that line.
+        version_gates=("megatron-core >=0.13,<0.17",),
         replace=_serial_writer,
         rationale=(
             "The affected MUSA stack showed torch.save segfaulting in a forked "
@@ -222,15 +242,16 @@ PATCHES = (
             "process, preserving its dict-or-Exception result protocol and "
             "staticmethod binding. This sacrifices bucket I/O parallelism, "
             "not checkpoint sharding, and does not remove external async forks. "
-            "CKPT_FORK=1 restores the original worker launcher."
+            "Disable this patch ID to restore the original worker launcher."
         ),
         upstream=(
-            "NVIDIA/Megatron-LM megatron/core/dist_checkpointing/strategies/" "filesystem_async.py"
+            "NVIDIA/Megatron-LM megatron/core/dist_checkpointing/strategies/"
+            "filesystem_async.py"
         ),
         remove_when=(
             "Review worker signatures/result protocol and async_utils on every "
             "Megatron/PyTorch/torch_musa upgrade. Remove after upstream uses a "
-            "validated safe launcher or CKPT_FORK=1 passes multi-rank post-init "
+            "validated safe launcher or the unpatched path passes multi-rank post-init "
             "save/load and worker-failure tests without hangs; benchmark writer "
             "throughput separately. Spawn alone is not a sufficient safety test."
         ),

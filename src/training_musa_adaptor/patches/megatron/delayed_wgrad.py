@@ -1,7 +1,4 @@
 """Plain TP=1 delayed weight gradients for the MT-TE 2.0 API gap.
-Migrated from megatron-musa-patch ``patches/_delayed_wgrad.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-
 
 Keep Megatron/TE construction and state dicts. Only the unavailable delayed
 forward/backward contract is implemented; no version predicate is changed.
@@ -38,7 +35,9 @@ def _delayed_init(original):
         original(self, *args, config=construction, **kwargs)
         self.config = config
         if self.tp_size != 1:
-            raise NotImplementedError("MUSA delayed wgrad fallback currently requires TP=1")
+            raise NotImplementedError(
+                "MUSA delayed wgrad fallback currently requires TP=1"
+            )
         self._musa_pending_wgrads = deque()
 
     return init
@@ -83,8 +82,13 @@ def _delayed_forward(original):
         import torch
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
-        if FP8GlobalStateManager.is_fp8_enabled() or FP8GlobalStateManager.is_fp8_calibration():
-            raise NotImplementedError("MUSA delayed wgrad fallback does not implement FP8")
+        if (
+            FP8GlobalStateManager.is_fp8_enabled()
+            or FP8GlobalStateManager.is_fp8_calibration()
+        ):
+            raise NotImplementedError(
+                "MUSA delayed wgrad fallback does not implement FP8"
+            )
         grouped = hasattr(self, "num_gemms")
         with self.prepare_forward(x, num_gemms=self.num_gemms if grouped else 1) as inp:
             inp = inp.to(self.activation_dtype)
@@ -96,10 +100,19 @@ def _delayed_forward(original):
             else:
                 chunks, weights, biases = [inp], [self.weight], [self.bias]
             outputs = [
-                _linear(chunk, w, b if self.use_bias and not self.te_return_bias else None, self)
-                for chunk, w, b in zip(chunks, weights, biases)
+                _linear(
+                    chunk,
+                    w,
+                    b if self.use_bias and not self.te_return_bias else None,
+                    self,
+                )
+                for chunk, w, b in zip(chunks, weights, biases, strict=True)
             ]
-            out = torch.cat(outputs, 0).view(*inp.shape[:-1], -1) if grouped else outputs[0]
+            out = (
+                torch.cat(outputs, 0).view(*inp.shape[:-1], -1)
+                if grouped
+                else outputs[0]
+            )
         self.is_first_microbatch = False
         bias = (
             (
@@ -152,7 +165,14 @@ PATCHES = tuple(
             if operation == "init"
             else ()
         ),
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # delay_wgrad_compute and TELinear/TEGroupedLinear.backward_dw exist
+        # from core_v0.13.0 and are unchanged through core_v0.19.0, the
+        # newest release line in the checkout; MT-TE 2.0 is the fork whose
+        # missing delayed contract this fallback supplies.
+        version_gates=(
+            "megatron-core >=0.13,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         rationale="MT-TE 2.0 lacks delay_wgrad_compute and backward_dw; offload overlap construction fails.",
         strategy=(
             "Keep original construction with a private config view only when both execution "
@@ -161,7 +181,8 @@ PATCHES = tuple(
             "Parameters, bias gradients and state dicts stay intact. FP8 and TP>1 are explicitly "
             "unsupported; per-expert GEMMs cost throughput and FP32 scratch."
         ),
-        upstream="Megatron-LM 55ac7082 megatron/core/extensions/transformer_engine.py:" + name,
+        upstream="Megatron-LM 55ac7082 megatron/core/extensions/transformer_engine.py:"
+        + name,
         remove_when="Remove after native MT-TE delayed wgrad passes offload overlap and gradient timing tests.",
     )
     for name in ("TELinear", "TEGroupedLinear")

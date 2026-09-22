@@ -1,8 +1,7 @@
 """Megatron Core GDN patch: TileLang dispatch of the chunked gated delta rule.
 
-Migrated from megatron-musa-patch ``patches/_ssm.py`` (rev a1090de); the
-dispatcher itself lives in ``ops/gated_delta_rule.py`` (shared with the
-mcore-bridge call site).  The retired ``GDN_TILELANG=0`` switch maps to
+The dispatcher lives in ``ops/gated_delta_rule.py`` (shared with the
+mcore-bridge call site).  Disable with
 ``TRAINING_MUSA_ADAPTOR_DISABLE=megatron.ssm.gated-delta-rule.tilelang``.
 """
 
@@ -27,6 +26,12 @@ PATCHES = (
         id="megatron.ssm.gated-delta-rule.tilelang",
         target=f"{_CORE_GDN}:chunk_gated_delta_rule",
         rebind_prefixes=("megatron",),
+        # megatron/core/ssm/gated_delta_net.py:chunk_gated_delta_rule exists
+        # from core_v0.16.0. core_v0.19.0 turns it into a package whose
+        # __init__ re-exports the same flash-linear-attention binding, so the
+        # target still resolves there (verified through core_v0.19.0, the
+        # newest release line in the checkout).
+        version_gates=("megatron-core >=0.16,<0.20",),
         replace=_replace,
         rationale=(
             "Megatron's GatedDeltaNet computes the chunked gated delta rule with "
@@ -52,7 +57,8 @@ PATCHES = (
             "two-chunk precondition. The TileLang kernels JIT-compile on first "
             "use per head count and dense/unpadded specialization (minutes, "
             "cached in ~/.tilelang); on multi-rank runs pre-warm the cache once "
-            "with examples/warm_gdn_tilelang.py -- every rank compiling the "
+            "in a single process for the intended shapes before workers start; "
+            "every rank compiling the "
             "same kernels into the shared cache concurrently has crashed runs "
             "(device error / SIGABRT). The TileLang stack is version-bound: "
             "tilelang-musa and torch-kernels upgrade only as a matched set with "

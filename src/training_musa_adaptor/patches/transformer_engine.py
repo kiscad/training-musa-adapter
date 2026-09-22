@@ -1,7 +1,6 @@
 """Transformer Engine call-shape adapters for the MUSA port.
 
-Migrated from megatron-musa-patch ``patches/_transformer_engine.py`` (rev
-a1090de). The two ``trigger="megatron"`` hooks now use the concrete
+The two ``trigger="megatron"`` hooks use the concrete
 ``megatron.core.parallel_state`` boundary (megatron is a namespace package
 and not an executable boundary; parallel_state is reachable in both import
 orders -- see patches/platform.py's boundary analysis).
@@ -67,7 +66,10 @@ def _install_quantized_model_init() -> bool:
     if original is None:
         return False
     signature = inspect.signature(original)
-    if not {"enabled", "recipe", "preserve_high_precision_init_val"} <= signature.parameters.keys():
+    if (
+        not {"enabled", "recipe", "preserve_high_precision_init_val"}
+        <= signature.parameters.keys()
+    ):
         return False
     from transformer_engine.common.recipe import DelayedScaling
 
@@ -141,7 +143,15 @@ def _script_factory_aliases(torch_module):
                     or wrapper.__module__ != "transformer_engine.musa"
                 ):
                     continue
-                closure = dict(zip(wrapper.__code__.co_freevars, wrapper.__closure__ or ()))
+                # A function without cells has no closure at all: keep the
+                # empty-mapping behavior instead of raising on the length gap.
+                closure = dict(
+                    zip(
+                        wrapper.__code__.co_freevars,
+                        wrapper.__closure__ or (),
+                        strict=False,
+                    )
+                )
                 cell = closure.get(f"original_{name}")
                 if cell is None:
                     continue
@@ -149,7 +159,9 @@ def _script_factory_aliases(torch_module):
                     original = cell.cell_contents
                 except ValueError:  # Empty closure cell: not this vendor contract.
                     continue
-                if original is not getattr(torch_module._C._VariableFunctions, name, None):
+                if original is not getattr(
+                    torch_module._C._VariableFunctions, name, None
+                ):
                     continue
                 key = id(wrapper)
                 previous = table.get(key, missing)
@@ -197,7 +209,9 @@ def _install_jit_script_compat() -> bool:
         # Class scripting resolves names from the caller's frame. Account for
         # this wrapper just as torch.jit.script accounts for its own frame.
         if "_frames_up" in signature.parameters:
-            arguments.arguments["_frames_up"] = arguments.arguments.get("_frames_up", 0) + 1
+            arguments.arguments["_frames_up"] = (
+                arguments.arguments.get("_frames_up", 0) + 1
+            )
         with _script_factory_aliases(torch):
             return original(*arguments.args, **arguments.kwargs)
 
@@ -235,7 +249,11 @@ def _install_safe_te_utils_module() -> bool:
 
     global _utils_module_owned
     name = "transformer_engine.musa.pytorch.utils"
-    if name in sys.modules or _utils_module_owned is not None or not _te_fork_needs_mem_monitor():
+    if (
+        name in sys.modules
+        or _utils_module_owned is not None
+        or not _te_fork_needs_mem_monitor()
+    ):
         return False
     unsafe = _compat.module_source_contains(
         "transformer_engine.musa.pytorch.utils",
@@ -335,7 +353,9 @@ def _cpu_offload_context_by_signature(original: Any) -> Any:
         return None
     if any(p.kind is p.VAR_POSITIONAL for p in parameters):
         return None
-    accepted = sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in parameters)
+    accepted = sum(
+        p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in parameters
+    )
     if accepted != 5:  # >= 6: upstream's choice is right; fewer: not this fork
         return None
 
@@ -349,7 +369,9 @@ def _cpu_offload_context_by_signature(original: Any) -> Any:
         double_buffering,
     ):
         """Get CPU offload context and sync function (five-argument TE)."""
-        return target(enabled, num_layers, model_layers, activation_offloading, weight_offloading)
+        return target(
+            enabled, num_layers, model_layers, activation_offloading, weight_offloading
+        )
 
     return get_cpu_offload_context
 
@@ -389,7 +411,7 @@ def _install_mem_monitor_shim() -> bool:
 
     package = types.ModuleType("musa_patch")
     package.__path__ = []  # mark as a package so submodule imports resolve
-    package.__doc__ = "Compatibility shim owned by megatron-musa-patch."
+    package.__doc__ = "Compatibility shim owned by training-musa-adaptor."
 
     mem_utils = types.ModuleType("musa_patch.mem_utils")
     mem_utils.__doc__ = "Shim for the MT-TE fork's grouped-linear memory accounting."

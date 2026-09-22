@@ -1,7 +1,4 @@
 """Open Megatron's TE CUDA-graph import gate for the MT-TE fork.
-Migrated from megatron-musa-patch ``patches/_cuda_graphs.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-
 
 ``megatron/core/transformer/cuda_graphs.py`` imports its whole Transformer
 Engine graph surface inside one ``try`` block, including
@@ -71,7 +68,9 @@ def _missing_torch_graph_apis(torch: Any) -> list[str]:
         isinstance(graph_cls, type)
         and callable(getattr(graph_cls, "register_generator_state", None))
     ):
-        missing.append("torch.cuda.CUDAGraph cannot register generator states (graph-safe RNG)")
+        missing.append(
+            "torch.cuda.CUDAGraph cannot register generator states (graph-safe RNG)"
+        )
     for name in (
         "graph",
         "graph_pool_handle",
@@ -188,7 +187,7 @@ def _build_make_weak_ref() -> Any:
             "torch.Tensor, tuple, list, dict, int, float, bool, and None."
         )
 
-    make_weak_ref.__megatron_musa_patch_port_of__ = (
+    make_weak_ref.__tma_port_of__ = (
         "NVIDIA/TransformerEngine transformer_engine/pytorch/utils.py::make_weak_ref"
     )
     return make_weak_ref
@@ -257,7 +256,9 @@ def _install_make_weak_ref() -> bool:
         return False
     missing = _missing_graph_prerequisites()
     if missing:
-        logger.info("megatron.te.make-weak-ref.graph-compat declined: %s", "; ".join(missing))
+        logger.info(
+            "megatron.te.make-weak-ref.graph-compat declined: %s", "; ".join(missing)
+        )
         return False
     import importlib
 
@@ -302,6 +303,11 @@ PATCHES = (
         trigger="megatron.core.parallel_state",
         run=_install_make_weak_ref,
         undo=_uninstall_make_weak_ref,
+        # Megatron's cuda_graphs.py try-import consumes TE's make_weak_ref
+        # only from core_v0.16.0; before that the gate it opens does not
+        # exist. The try-import seam is unchanged through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.16,<0.20",),
         rationale=(
             "Megatron core_v0.16.1 opens its whole TE graph surface inside one "
             "try block in megatron/core/transformer/cuda_graphs.py, including "

@@ -6,10 +6,9 @@ MUSA, and the Qwen3-VL text tower normalizes through
 post-attention, final norm, plus the per-head q/k norms). Upstream implements
 the op as a chain of small kernels -- fp32 cast, ``pow(2)``, ``mean``, eps
 add, ``rsqrt``, multiply, cast back, weight multiply -- so every call pays
-several kernel launches where one fused kernel would do. On torch_musa the
-fused ATen op ``torch.rms_norm`` measured 8.1x faster forward and 5.4x faster
-forward+backward than the upstream chain (bf16, 8192x4096, MTT S5000; measured
-by megatron-musa-patch, see docs/PATCHES.md there).
+several kernel launches where one fused kernel would do. The fused
+ATen op ``torch.rms_norm`` reduces launch overhead on the supported path.
+Measure forward/backward and training throughput on the actual target stack.
 
 This is a kernel-selection patch, not a crash repair: the upstream chain is
 numerically correct, and the fused kernel differs from it only in rounding
@@ -18,16 +17,13 @@ rounds to the input dtype first). ``@use_kernel_forward_from_hub("RMSNorm")``
 is inert unless the caller opts into the ``kernels`` library, in which case
 upstream's own swap wins at model init.
 
-Migrated from megatron-musa-patch ``patches/_transformers.py`` (rev a1090de)
-to the design-doc §4.1 target writing: compared with the old wrapper this
-adds the plain-Tensor guard (tensor subclasses delegate), the MUSA-device
+The wrapper checks for plain tensors (tensor subclasses delegate), the MUSA-device
 guard (non-MUSA calls delegate instead of relying on torch.rms_norm to
 error), the weight/activation same-device guard, and the fp16/bf16 dtype
 restriction (fp32 calls stay on the upstream chain -- the fused win is a
 reduced-precision win and fp32 delegation is bit-identical to upstream).
-The old per-patch env switch (MEGATRON_MUSA_PATCH_QWEN3VL_RMS_NORM) is
-retired: v2.0 configuration disables patches by ID
-(TRAINING_MUSA_ADAPTOR_DISABLE=transformers.qwen3-vl.text-rms-norm.fused-torch).
+Disable the patch with
+``TRAINING_MUSA_ADAPTOR_DISABLE=transformers.qwen3-vl.text-rms-norm.fused-torch``.
 """
 
 from __future__ import annotations
@@ -112,11 +108,8 @@ PATCHES = (
             "semantics stay exact. Parameters, state dict, the "
             "variance_epsilon attribute and upstream's kernels-library "
             "opt-in are untouched; torch is imported inside the factory. "
-            "Measured on MTT S5000 (bf16, 8192x4096): forward 8.1x, "
-            "forward+backward 5.4x versus the upstream chain; bf16/fp16 "
-            "outputs agree with the upstream chain to within ~1-2 ulp of "
-            "the input dtype (the fused kernel rounds once, after the "
-            "weight multiply). "
+            "Rounding differs because the fused kernel rounds after the weight "
+            "multiply; numerical tolerances are checked by the MUSA tests. "
             "TRAINING_MUSA_ADAPTOR_DISABLE=transformers.qwen3-vl.text-rms-norm.fused-torch "
             "keeps the upstream chain."
         ),
@@ -129,7 +122,6 @@ PATCHES = (
             "Review on transformers or torch_musa upgrades; remove when "
             "upstream fuses the op itself or torch_musa's eager small-op "
             "kernels make the chain competitive, verified by re-running "
-            "tests/test_transformers_rms_norm.py and "
             "tests/integration/test_rms_norm_musa.py with this patch "
             "disabled."
         ),

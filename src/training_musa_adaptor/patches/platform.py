@@ -1,19 +1,18 @@
 """Device-layer hooks: install the ``torch.cuda`` compat layer per framework.
 
-v2.0 has no "Megatron must exist" global assumption (design doc §5.1): each
-framework installs the same idempotent helper at its own verified import
+Each framework installs the same idempotent helper at its own verified import
 boundary, and a transformers-only run is a first-class scenario. Every hook
 below calls :func:`backends.torch_cuda.ensure_cuda_compat`; whichever hook
 fires first owns the undo, later hooks decline (``False`` -> skipped).
 
-Trigger selection (design doc §4.2: a real exec body, before the behavior
-the hook prepares; namespace roots are not hook points). Verified against
+Triggers need a real exec body before the behavior the hook prepares;
+namespace roots are not hook points. Verified against
 megatron-core 0.16.1 and transformers 5.16.1 by tracing ``find_spec`` calls
 alongside watcher installation:
 
 - ``megatron`` is a *namespace* package in both the megatron-core wheel and
   the Megatron-LM source checkout (no ``__init__.py``): it cannot be a hook
-  boundary, so the old ``trigger="megatron"`` does not migrate mechanically.
+  boundary; choose a concrete executable submodule.
 - Order ``import torch; import megatron.core``: the watcher is installed at
   the end of ``import torch``, so ``megatron.core`` is the earliest legal
   megatron boundary.
@@ -32,7 +31,7 @@ alongside watcher installation:
   The ``transformers`` root hook covers the dominant ``import torch;
   import transformers`` order at the earliest point.
 
-Known gaps (recorded in docs/MIGRATION_LEDGER.md, not silently worked
+Known gaps (recorded in docs/PATCH_LEDGER.md, not silently worked
 around):
 
 - In the megatron-first order the ``megatron.core`` hook never fires and
@@ -106,8 +105,7 @@ PATCHES = (
         trigger="megatron.core.parallel_state",
         run=torch_cuda.ensure_cuda_compat,
         undo=torch_cuda.unapply,
-        strategy=_STRATEGY
-        + " Boundary: first megatron boundary still reachable when "
+        strategy=_STRATEGY + " Boundary: first megatron boundary still reachable when "
         "'import megatron.core' itself triggers the first torch import "
         "(megatron.core and megatron.core.tensor_parallel boundaries are "
         "already gone); earlier modules make no import-time CUDA calls.",

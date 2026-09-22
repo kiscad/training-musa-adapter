@@ -1,7 +1,4 @@
 """Module-local MoE adapters for the MUSA stack.
-Migrated from megatron-musa-patch ``patches/_moe.py`` (rev a1090de).
-The retired per-patch env switch maps to ONLY/DISABLE on the patch IDs.
-
 
 These patches replace names inside ``megatron.core.transformer.moe.moe_utils``
 only. The forwarding ``torch`` namespace adapts exactly the kernels the MUSA
@@ -28,10 +25,8 @@ from ...backends import musa_available as _musa_live
 
 __all__ = ["PATCHES"]
 
-import logging as _logging
-_compat_logger_shim = _logging.getLogger("training_musa_adaptor")
 
-logger = logging.getLogger("megatron_musa_patch")
+logger = logging.getLogger("training_musa_adaptor")
 
 
 def _fp64_topk(torch, input, k, dim, largest, sorted):
@@ -44,7 +39,9 @@ def _fp64_topk(torch, input, k, dim, largest, sorted):
     """
     if dim is None:
         dim = -1  # torch.topk's documented default
-    _, cpu_indices = torch.topk(input.detach().cpu(), k=k, dim=dim, largest=largest, sorted=sorted)
+    _, cpu_indices = torch.topk(
+        input.detach().cpu(), k=k, dim=dim, largest=largest, sorted=sorted
+    )
     indices = cpu_indices.to(input.device)
     return torch.return_types.topk((input.gather(dim, indices), indices))
 
@@ -58,10 +55,16 @@ class _MoeTorchProxy:
     def __getattr__(self, name):
         return getattr(self._torch, name)
 
-    def topk(self, input, k, dim=None, largest=True, sorted=True, *, out=None):
+    def topk(self, input, k, dim=-1, largest=True, sorted=True, *, out=None):
         if out is not None:
-            return self._torch.topk(input, k, dim=dim, largest=largest, sorted=sorted, out=out)
-        if input.dtype == self._torch.float64 and input.device.type == "musa" and _musa_live():
+            return self._torch.topk(
+                input, k, dim=dim, largest=largest, sorted=sorted, out=out
+            )
+        if (
+            input.dtype == self._torch.float64
+            and input.device.type == "musa"
+            and _musa_live()
+        ):
             logger.debug(
                 "MoE topk FP64 reference path: shape=%s k=%s dim=%s",
                 tuple(input.shape),
@@ -82,18 +85,21 @@ def _fp64_topk_works_on_musa() -> bool:
     import torch
 
     try:
-        values, indices = torch.topk(torch.arange(8, device="musa", dtype=torch.float64), 2)
+        values, indices = torch.topk(
+            torch.arange(8, device="musa", dtype=torch.float64), 2
+        )
         if values.cpu().tolist() != [7.0, 6.0] or indices.cpu().tolist() != [7, 6]:
             return False
     except Exception as exc:  # noqa: BLE001 - any failure means still broken
-        _compat_logger_shim.info(
+        logger.info(
             "moe topk fp64 probe failed, keeping the reference path (%s: %s)",
             type(exc).__name__,
             exc,
         )
         return False
-    _compat_logger_shim.info(
-        "moe topk fp64-reference declined: fp64 topk works on this " "torch_musa build (%s)",
+    logger.info(
+        "moe topk fp64-reference declined: fp64 topk works on this "
+        "torch_musa build (%s)",
         _compat.distribution_version("torch-musa"),
     )
     return True
@@ -130,7 +136,12 @@ def _moe_permute_unfused(original: Any) -> Any:
 
     @functools.wraps(original)
     def permute(
-        tokens, routing_map, probs=None, num_out_tokens=None, fused=False, drop_and_pad=False
+        tokens,
+        routing_map,
+        probs=None,
+        num_out_tokens=None,
+        fused=False,
+        drop_and_pad=False,
     ):
         demote = fused and _fused_permute_unsupported(tokens)
         if demote:
@@ -166,7 +177,9 @@ def _moe_unpermute_unfused(original: Any) -> Any:
     ):
         demote = fused and _fused_permute_unsupported(permuted_tokens)
         if demote:
-            logger.debug("MoE unpermute unfused fallback: dtype=%s", permuted_tokens.dtype)
+            logger.debug(
+                "MoE unpermute unfused fallback: dtype=%s", permuted_tokens.dtype
+            )
         return original(
             permuted_tokens,
             sorted_indices,
@@ -180,12 +193,53 @@ def _moe_unpermute_unfused(original: Any) -> Any:
     return unpermute
 
 
+def _moe_permute_unfused_core17(original: Any) -> Any:
+    """core>=0.17 ``permute`` variant: the a2a dispatcher passes explicit
+    ``tokens_per_expert``/``align_size`` keywords (added in core_v0.17.0),
+    so this variant forwards ``*args``/``**kwargs`` untouched and flips only
+    the ``fused`` keyword -- the form every Megatron call site uses."""
+
+    @functools.wraps(original)
+    def permute(tokens, routing_map, *args, **kwargs):
+        if kwargs.get("fused") and _fused_permute_unsupported(tokens):
+            logger.debug(
+                "MoE permute unfused fallback (core>=0.17): dtype=%s shape=%s",
+                tokens.dtype,
+                tuple(tokens.shape),
+            )
+            return original(tokens, routing_map, *args, **{**kwargs, "fused": False})
+        return original(tokens, routing_map, *args, **kwargs)
+
+    return permute
+
+
+def _moe_unpermute_unfused_core17(original: Any) -> Any:
+    """core>=0.17 ``unpermute`` variant; pairs with the core17 permute
+    fallback so both ends keep the same index format."""
+
+    @functools.wraps(original)
+    def unpermute(permuted_tokens, *args, **kwargs):
+        if kwargs.get("fused") and _fused_permute_unsupported(permuted_tokens):
+            logger.debug(
+                "MoE unpermute unfused fallback (core>=0.17): dtype=%s",
+                permuted_tokens.dtype,
+            )
+            return original(permuted_tokens, *args, **{**kwargs, "fused": False})
+        return original(permuted_tokens, *args, **kwargs)
+
+    return unpermute
+
+
 def _router_fp64_linear(original):
     @functools.wraps(original)
     def linear(inp, weight, bias, router_dtype):
         import torch
 
-        if inp.device.type != "musa" or router_dtype != torch.float64 or not _musa_live():
+        if (
+            inp.device.type != "musa"
+            or router_dtype != torch.float64
+            or not _musa_live()
+        ):
             return original(inp, weight, bias, router_dtype)
         # Keep true FP64 arithmetic and gradients. MuDNN's addmm/mm does
         # not support this router dtype; demoting would change routing ties.
@@ -201,9 +255,8 @@ def _router_fp64_linear(original):
 def _torch_kernels_router_entry_points():
     """torch_kernels' three fused-router entry points, or None when unusable.
 
-    Imported lazily at patch time (a real MUSA process by then); a missing or
-    broken torch_kernels install declines the bridge so Megatron keeps its own
-    "not available" error instead of a worse one.
+    Imported lazily at patch time. A missing package declines the bridge;
+    failures inside an installed package propagate with their original cause.
     """
     try:
         from torch_kernels.router import (
@@ -211,15 +264,21 @@ def _torch_kernels_router_entry_points():
             fused_moe_aux_loss,
             fused_topk_with_score_function,
         )
-    except Exception as exc:  # noqa: BLE001 - any import failure declines
-        _compat_logger_shim.info(
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch_kernels":
+            raise
+        logger.info(
             "torch_kernels fused router unavailable (%s: %s); Megatron's "
             "moe_router_fusion keeps upstream's TE>=2.7 requirement error",
             type(exc).__name__,
             exc,
         )
         return None
-    return fused_topk_with_score_function, fused_moe_aux_loss, fused_compute_score_for_moe_aux_loss
+    return (
+        fused_topk_with_score_function,
+        fused_moe_aux_loss,
+        fused_compute_score_for_moe_aux_loss,
+    )
 
 
 def _fused_router_bridge(entry_index: int):
@@ -227,7 +286,7 @@ def _fused_router_bridge(entry_index: int):
 
     Only ever replaces the ``None`` placeholder MT-TE 2.0 leaves behind: a
     real TransformerEngine implementation (TE>=2.7 stacks) wins, the
-    MEGAtron_MUSA_PATCH_MOE_ROUTER_FUSION=0 switch restores upstream, and a
+    DISABLE list can restore upstream, and a
     missing torch_kernels declines so Megatron's own error surfaces.
     """
 
@@ -254,6 +313,10 @@ PATCHES = (
         id="megatron.moe.router-gating.fp64-host",
         rebind_prefixes=("megatron",),
         target="megatron.core.transformer.moe.moe_utils:router_gating_linear",
+        # RouterGatingLinearFunction exists from core_v0.13.0 with the same
+        # (inp, weight, bias, router_dtype) signature through core_v0.19.0,
+        # the newest release line in the checkout.
+        version_gates=("megatron-core >=0.13,<0.20",),
         replace=_router_fp64_linear,
         rationale="FP64 router addmm fails in MuDNN RunWithBiasAdd once delayed-wgrad construction succeeds.",
         strategy=(
@@ -268,6 +331,11 @@ PATCHES = (
         id="megatron.moe.topk.fp64-reference",
         rebind_prefixes=("megatron",),
         target="megatron.core.transformer.moe.moe_utils:torch",
+        # The fp64-router scenario this proxy protects (RouterGatingLinearFunction
+        # with a free-form moe_router_dtype) exists from core_v0.13.0;
+        # moe_router_dtype keeps its 'fp64' choice through core_v0.19.0, the
+        # newest release line in the checkout.
+        version_gates=("megatron-core >=0.13,<0.20",),
         replace=_moe_torch_namespace,
         rationale=(
             "MoE routing calls torch.topk on router scores. With "
@@ -306,6 +374,12 @@ PATCHES = (
         id="megatron.moe.permutation.unfused-musa",
         rebind_prefixes=("megatron",),
         target="megatron.core.transformer.moe.moe_utils:permute",
+        # The fused permute branch (fused_permute, drop_and_pad) that this
+        # patch demotes exists from core_v0.11.0. Capped at <0.17:
+        # core_v0.17.0 adds tokens_per_expert/align_size and its a2a
+        # dispatcher passes them, so that contract is carried by the separate
+        # core17 variant below.
+        version_gates=("megatron-core >=0.11,<0.17",),
         replace=_moe_permute_unfused,
         rationale=(
             "The token dispatcher's fused permute calls TE's moe_permute, whose "
@@ -337,6 +411,10 @@ PATCHES = (
         id="megatron.moe.unpermutation.unfused-musa",
         rebind_prefixes=("megatron",),
         target="megatron.core.transformer.moe.moe_utils:unpermute",
+        # Same fused-permute envelope as the permute companion (unpermute
+        # gains pad_offsets in core_v0.17.0 -- carried by the core17 variant
+        # below).
+        version_gates=("megatron-core >=0.11,<0.17",),
         replace=_moe_unpermute_unfused,
         requires=("megatron.moe.permutation.unfused-musa",),
         rationale=(
@@ -362,9 +440,77 @@ PATCHES = (
         ),
     ),
     AttrPatch(
+        id="megatron.moe.permutation.unfused-musa.core17",
+        rebind_prefixes=("megatron",),
+        target="megatron.core.transformer.moe.moe_utils:permute",
+        # core_v0.17.0 adds tokens_per_expert/align_size to permute and its
+        # a2a dispatcher passes them; a separate variant keeps the 0.11-0.16
+        # patch simple. Verified through core_v0.19.0, the newest release
+        # line in the checkout.
+        version_gates=("megatron-core >=0.17,<0.20",),
+        replace=_moe_permute_unfused_core17,
+        rationale=(
+            "Same MUSA fused-permute abort as the 0.11-0.16 patch, on the "
+            "core_v0.17.0+ contract: permute gains tokens_per_expert/align_size "
+            "and the a2a dispatcher passes them explicitly, so the earlier "
+            "fixed-signature wrapper would TypeError. The MUSA TE permutation "
+            "kernel still rejects float32/float64 tokens on this stack."
+        ),
+        strategy=(
+            "Separate variant patch (not a wider signature bolted onto the "
+            "validated 0.11-0.16 one): forward *args/**kwargs untouched and "
+            "flip only the fused keyword -- the form every Megatron call site "
+            "uses -- when the token dtype is a confirmed-broken one on a live "
+            "MUSA device. Positional fused callers are not adapted and keep "
+            "upstream behavior. Use together with the core17 unpermute variant."
+        ),
+        upstream="NVIDIA/Megatron-LM megatron/core/transformer/moe/moe_utils.py:permute",
+        remove_when=(
+            "Remove when the MUSA TE permutation kernel supports 32-bit inputs: "
+            "disable both core17 permutation patch ids and re-run "
+            "transformer/moe/test_a2a_token_dispatcher.py forward/backward; "
+            "delete only if the fused path passes."
+        ),
+    ),
+    AttrPatch(
+        id="megatron.moe.unpermutation.unfused-musa.core17",
+        rebind_prefixes=("megatron",),
+        target="megatron.core.transformer.moe.moe_utils:unpermute",
+        # Same core17 contract as the permute variant (unpermute gains
+        # pad_offsets in core_v0.17.0). Verified through core_v0.19.0.
+        version_gates=("megatron-core >=0.17,<0.20",),
+        replace=_moe_unpermute_unfused_core17,
+        requires=("megatron.moe.permutation.unfused-musa.core17",),
+        rationale=(
+            "The fused unpermute uses the same MUSA permutation kernel family "
+            "as the fused permute, and core_v0.17.0 adds pad_offsets to its "
+            "signature. Restoring tokens must stay on the same index format as "
+            "the permute that produced them: mixing a non-fused permute with "
+            "the fused unpermute (or vice versa) silently scrambles token order."
+        ),
+        strategy=(
+            "Separate variant patch paired with the core17 permute fallback: "
+            "forward *args/**kwargs untouched and flip only the fused keyword "
+            "under the same dtype condition. Declared as requiring the core17 "
+            "permute variant so ONLY/DISABLE cannot activate unpermute without "
+            "permute."
+        ),
+        upstream="NVIDIA/Megatron-LM megatron/core/transformer/moe/moe_utils.py:unpermute",
+        remove_when=(
+            "Remove together with megatron.moe.permutation.unfused-musa.core17 "
+            "after the MUSA TE permutation kernel supports 32-bit inputs and "
+            "the a2a dispatcher forward/backward passes on the fused path."
+        ),
+    ),
+    AttrPatch(
         id="megatron.moe.fused-router.topk-with-score-function",
         rebind_prefixes=("megatron",),
         target="megatron.core.extensions.transformer_engine:fused_topk_with_score_function",
+        # The TE>=2.7 fused-router import guards (and the moe_router_fusion
+        # config that consumes them) exist from core_v0.14.0; the same
+        # is_te_min_version('2.7.0.dev') guard is still in place at
+        # core_v0.19.0, the newest release line in the checkout.
+        version_gates=("megatron-core >=0.14,<0.20",),
         replace=_TOPK_BRIDGE,
         rationale=(
             "Megatron's moe_router_fusion path calls TE>=2.7's "
@@ -385,7 +531,7 @@ PATCHES = (
             "through the reference composition; torch_kernels' own tests pin "
             "it bit-exactly against Megatron's reference math. Only replaces "
             "the None placeholder -- a real TE>=2.7 implementation wins; "
-            "MEGATRON_MUSA_PATCH_MOE_ROUTER_FUSION=0 and a missing "
+            "disabling these router patches and a missing "
             "torch_kernels both decline to keep upstream's error."
         ),
         upstream=(
@@ -403,6 +549,9 @@ PATCHES = (
         id="megatron.moe.fused-router.moe-aux-loss",
         rebind_prefixes=("megatron",),
         target="megatron.core.extensions.transformer_engine:fused_moe_aux_loss",
+        # Same TE>=2.7 fused-router guard envelope as the topk bridge
+        # (core_v0.14.0; verified through core_v0.19.0).
+        version_gates=("megatron-core >=0.14,<0.20",),
         replace=_AUX_LOSS_BRIDGE,
         rationale=(
             "The same TE>=2.7 import guard leaves fused_moe_aux_loss as None; "
@@ -432,6 +581,9 @@ PATCHES = (
         rebind_prefixes=("megatron",),
         target="megatron.core.extensions.transformer_engine:"
         "fused_compute_score_for_moe_aux_loss",
+        # Same TE>=2.7 fused-router guard envelope as the topk bridge
+        # (core_v0.14.0; verified through core_v0.19.0).
+        version_gates=("megatron-core >=0.14,<0.20",),
         replace=_SCORE_BRIDGE,
         rationale=(
             "The same TE>=2.7 import guard leaves "

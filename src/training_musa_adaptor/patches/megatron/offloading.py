@@ -1,9 +1,4 @@
-"""Keep resident TE weights out of activation-only offloading.
-
-Migrated from megatron-musa-patch ``patches/_offloading.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-"""
-
+"""Keep resident TE weights out of activation-only offloading."""
 
 from __future__ import annotations
 
@@ -51,7 +46,7 @@ def _preserve_offload_markers(original):
         if len(saved) == len(tensors) and all(
             t is None or type(t) in (torch.Tensor, torch.nn.Parameter) for t in tensors
         ):
-            for source, detached in zip(tensors, saved):
+            for source, detached in zip(tensors, saved, strict=True):
                 if source is None or detached is None:
                     continue
                 if (
@@ -70,7 +65,14 @@ PATCHES = (
         id="transformer_engine.saved-tensors.offload-markers",
         target="transformer_engine.pytorch.tensor.quantized_tensor:prepare_for_saving",
         rebind_prefixes=("transformer_engine",),
-        version_gates=("transformer_engine >=2.0,<2.1",),
+        # TE-side target; its megatron-side consumer (fine-grained activation
+        # offloading) exists from core_v0.16.0, unchanged through core_v0.19.0,
+        # the newest release line in the checkout. MT-TE 2.0 is the fork
+        # losing the offload markers.
+        version_gates=(
+            "megatron-core >=0.16,<0.20",
+            "transformer_engine >=2.0,<2.1",
+        ),
         replace=_preserve_offload_markers,
         rationale="MT-TE prepare_for_saving uses tensor.data, losing Parameter identity and offload markers.",
         strategy=(
@@ -85,6 +87,10 @@ PATCHES = (
         id="megatron.offloading.resident-parameters",
         rebind_prefixes=("megatron",),
         target="megatron.core.pipeline_parallel.fine_grained_activation_offload:ChunkOffloadHandler.tensor_need_offloading_checker",
+        # ChunkOffloadHandler (fine_grained_activation_offload) exists from
+        # core_v0.16.0 with the same checker signature through core_v0.19.0,
+        # the newest release line in the checkout.
+        version_gates=("megatron-core >=0.16,<0.20",),
         replace=_activation_only,
         rationale=(
             "MT-TE saves resident Parameters and weight_offloading-tagged tensors inside "

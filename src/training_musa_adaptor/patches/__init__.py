@@ -15,9 +15,10 @@ factories or safe initialization functions.
 
 from __future__ import annotations
 
-__all__ = ["PATCHES", "MODULES"]
+__all__ = ["PATCHES", "MODULES", "SUITES", "PATCH_SUITES"]
 
-from . import mcore_bridge, platform, transformer_engine
+from . import platform, transformer_engine
+from .mcore_bridge import ssm as mcore_bridge_ssm
 from .megatron import (
     attention,
     checkpointing,
@@ -37,8 +38,6 @@ from .megatron import (
 )
 from .transformers import rms_norm
 
-# Populated as domains migrate (docs/MIGRATION_LEDGER.md tracks status):
-#   transformer_engine, megatron.layer_norm, megatron.rope, megatron.ssm, ...
 MODULES = (
     platform,
     delayed_wgrad,
@@ -57,8 +56,44 @@ MODULES = (
     checkpointing,
     control_collectives,
     ssm,
-    mcore_bridge,
+    mcore_bridge_ssm,
     rms_norm,
 )
 
 PATCHES = tuple(patch for module in MODULES for patch in module.PATCHES)
+
+#: Adaptation domain a patch belongs to.  Suite names are accepted in
+#: ONLY/DISABLE (environment and TOML) and expand to every patch id of that
+#: suite, so a whole domain can be toggled at once (e.g. when another team
+#: owns the Megatron MUSA adaptation).
+SUITES = {
+    "platform": (platform,),
+    "megatron": (
+        delayed_wgrad,
+        device_arch,
+        distributed,
+        cuda_graphs,
+        attention,
+        layer_norm,
+        moe,
+        offloading,
+        grouped_gemm,
+        rope,
+        softmax,
+        training,
+        checkpointing,
+        control_collectives,
+        ssm,
+    ),
+    "transformer_engine": (transformer_engine,),
+    "transformers": (rms_norm,),
+    "mcore_bridge": (mcore_bridge_ssm,),
+}
+
+#: patch id -> suite name (covers every registered patch exactly once).
+PATCH_SUITES = {
+    patch.id: suite
+    for suite, modules in SUITES.items()
+    for module in modules
+    for patch in module.PATCHES
+}

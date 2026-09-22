@@ -1,7 +1,4 @@
 """Module-local control collectives; never replace process-wide torch APIs.
-Migrated from megatron-musa-patch ``patches/_control_collectives.py`` (rev a1090de).
-Retired per-patch env switches map to ONLY/DISABLE on the patch IDs.
-
 
 The upstream functions keep their code and module globals. A forwarding torch
 namespace intercepts only their control-plane calls, preserving training tensor
@@ -39,7 +36,9 @@ class _DistributedProxy:
         if not dist.is_initialized() or "mccl" not in str(dist.get_backend()).lower():
             return None
         if self._world is not dist.group.WORLD:
-            group = dist.new_group(backend="gloo", timeout=timedelta(minutes=timeout_minutes))
+            group = dist.new_group(
+                backend="gloo", timeout=timedelta(minutes=timeout_minutes)
+            )
             self._world, self._group = dist.group.WORLD, group
         return self._group
 
@@ -67,7 +66,9 @@ class _DistributedProxy:
             # Match synchronize_start_time: truncate to integer microseconds,
             # reduce integers, then restore the original seconds-valued tensor.
             value = torch.tensor(
-                [int(tensor.item() * 1_000_000)], dtype=torch.int64, device=tensor.device
+                [int(tensor.item() * 1_000_000)],
+                dtype=torch.int64,
+                device=tensor.device,
             )
             result = dist.all_reduce(value, *args, **kwargs)
             tensor.fill_(value.item() / 1_000_000)
@@ -130,7 +131,9 @@ def _checkpoint_save(original):
 def _signal_globals(original):
     from signal import Signals
 
-    aliases = [(member, f"signal.{name}") for name, member in Signals.__members__.items()]
+    aliases = [
+        (member, f"signal.{name}") for name, member in Signals.__members__.items()
+    ]
     return list(original) + [alias for alias in aliases if alias not in original]
 
 
@@ -139,6 +142,10 @@ PATCHES = (
         id="megatron.training.start-time.integer-microseconds",
         rebind_prefixes=("megatron",),
         target="megatron.training.training:torch",
+        # pretrain's float64 MIN startup-timestamp all_reduce exists from
+        # core_v0.6.0 (the current megatron package layout) and is unchanged
+        # through core_v0.19.0, the newest release line in the checkout.
+        version_gates=("megatron-core >=0.6,<0.20",),
         replace=_startup_torch,
         rationale="MCCL 2.11.4 reduced startup float64 MIN timestamps to 1.0.",
         strategy=(
@@ -155,6 +162,11 @@ PATCHES = (
         id="megatron.training.checkpoint.host-barrier-proxy",
         rebind_prefixes=("megatron",),
         target="megatron.training.checkpointing:torch",
+        # megatron/training/checkpointing.py (save_checkpoint's barriers)
+        # exists from core_v0.6.0; the barriers still run through the module
+        # torch global at core_v0.19.0, the newest release line in the
+        # checkout.
+        version_gates=("megatron-core >=0.6,<0.20",),
         replace=_checkpoint_torch,
         rationale="MCCL device barriers can exceed the device watchdog during slow checkpoint I/O.",
         strategy=(
@@ -172,6 +184,9 @@ PATCHES = (
         rebind_prefixes=("megatron",),
         requires=("megatron.training.checkpoint.host-barrier-proxy",),
         target="megatron.training.checkpointing:save_checkpoint",
+        # Same module envelope as host-barrier-proxy; verified through
+        # core_v0.19.0, the newest release line in the checkout.
+        version_gates=("megatron-core >=0.6,<0.20",),
         replace=_checkpoint_save,
         rationale="All ranks must create the checkpoint host group before diverging into disk I/O.",
         strategy=(
@@ -188,6 +203,10 @@ PATCHES = (
         id="megatron.serialization.signal-member-globals",
         rebind_prefixes=("megatron",),
         target="megatron.core.safe_globals:SAFE_GLOBALS",
+        # megatron/core/safe_globals.py exists from core_v0.14.0;
+        # SAFE_GLOBALS is still the list register_safe_globals iterates at
+        # core_v0.19.0, the newest release line in the checkout.
+        version_gates=("megatron-core >=0.14,<0.20",),
         replace=_signal_globals,
         rationale="Python 3.10 pickles Signals by signal.SIGTERM names, not only the Signals class.",
         strategy=(
