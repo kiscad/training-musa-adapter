@@ -1,0 +1,88 @@
+# training-musa-adaptor 配置样例（覆盖全部 TOML 字段；按需取消注释并修改）。
+#
+# 启用方式（二选一）：
+#   export TRAINING_MUSA_ADAPTOR_CONFIG=/absolute/path/to/this-file.toml
+#   （或）在训练入口显式安装：
+#       import training_musa_adaptor as tma
+#       tma.install(config_path="/absolute/path/to/this-file.toml")
+#
+# 生效验证：
+#   training-musa-adaptor config
+#   （打印当前进程冻结后的有效配置、每个字段的来源与归一化说明）
+#
+# 优先级：内置默认值 < 本文件 < 环境变量（TRAINING_MUSA_ADAPTOR_*）。
+# 同一来源内，[patch_options."…"] 覆盖 [attention]；更高来源仍整体优先。
+# 列表为整体替换，不合并。未知字段、未知 patch ID、未知实现名、重复项都会报错。
+#
+# 注意：ENABLED / AUTOLOAD / DEBUG 是启动开关，只能用环境变量
+# （TRAINING_MUSA_ADAPTOR_ENABLED / _AUTOLOAD / _DEBUG）；TOML 中没有对应字段。
+
+# ---------------------------------------------------------------------------
+# 补丁启用范围
+# ---------------------------------------------------------------------------
+# 规则：
+#   - patches.only 非空时为白名单模式，patches.disable 被完全忽略；
+#   - patches.only 为空时，默认集合减去 patches.disable；
+#   - 两个列表中的条目也可以是套件名，展开为该套件下全部补丁 ID；
+#     套件：megatron（patches/megatron/ 全部适配，含其中 TE/torch 目标补丁）、
+#     transformer_engine、transformers、mcore_bridge、platform。
+#   - 两个列表中的 ID 都会校验（`training-musa-adaptor list` 查看全部 ID），
+#     ONLY 不会自动补齐依赖补丁；只排除个别补丁时优先用 disable。
+# ---------------------------------------------------------------------------
+
+[patches]
+# 例：一键禁用整个 megatron 适配套件（交给另一套 Megatron MUSA 适配时使用）
+# disable = ["megatron"]
+
+# 例：禁用 transformers 的 RMSNorm 融合补丁（保留其余全部补丁）
+# disable = ["transformers.qwen3-vl.text-rms-norm.fused-torch"]
+
+# 例：只启用两个补丁（白名单模式；此时 disable 无效）
+# only = [
+#     "megatron.te.attention.capability-dispatch",
+#     "megatron.ssm.gated-delta-rule.tilelang",
+# ]
+
+# ---------------------------------------------------------------------------
+# Attention 实现选择（作用域：所有已接入的 attention 调用点）
+# ---------------------------------------------------------------------------
+# 可用实现：mudnn / mate / te_unfused / flash_attn / torch_sdpa_math
+# 策略与约束：
+#   auto     — implementations 必须为空；按内置候选顺序选择，全部拒绝后按 fallback
+#   prefer   — implementations 非空有序；先试指定项，再试其余内置候选，最后按 fallback
+#   force    — implementations 恰好一个；MUSA 输入必须由它执行，不适用即报错，不降级
+#   upstream — implementations 必须为空；原参数交回原始实现，不保证 MUSA 可用
+# fallback：reference（参考实现）/ upstream（原始调用）/ error（直接报错）
+# 注意：policy 为 force / upstream 时，其他 fallback 值会被归一化为 error
+# （归一化记录在 `training-musa-adaptor config` 输出的 notes 中）。
+# ---------------------------------------------------------------------------
+
+[attention]
+policy = "auto"
+implementations = []
+fallback = "reference"
+
+# 例：优先 mate，其次 mudnn，其余内置候选兜底
+# [attention]
+# policy = "prefer"
+# implementations = ["mate", "mudnn"]
+# fallback = "reference"
+
+# 例：强制 mate（不适用直接报错；fallback 被归一化为 error）
+# [attention]
+# policy = "force"
+# implementations = ["mate"]
+
+# 例：整个 attention 调用点交回上游实现（用于对照/排障）
+# [attention]
+# policy = "upstream"
+
+# ---------------------------------------------------------------------------
+# 单补丁覆盖（同一来源内覆盖 [attention]；环境变量仍优先于本文件）
+# ---------------------------------------------------------------------------
+# 目前仅 attention capability-dispatch 补丁声明了选项字段；
+# 只有需要覆盖通用 attention 配置时才添加此段。
+
+# [patch_options."megatron.te.attention.capability-dispatch"]
+# policy = "force"
+# implementations = ["mate"]
