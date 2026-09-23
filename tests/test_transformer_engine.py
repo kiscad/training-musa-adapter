@@ -357,6 +357,101 @@ def test_jit_script_compat_round_trip(monkeypatch):
         torch.arange = previous
 
 
+def test_factory_shim_alias_survives_chained_shims(monkeypatch):
+    """MT-TE wrappers capturing torchada's factory wrapper still alias.
+
+    This project's torch.cuda compat layer wraps the ATen factory first
+    (torchada), so MT-TE's ``original_arange`` closure holds that wrapper
+    instead of the raw ATen function. The alias guard must walk the chain;
+    the scripted graph then resolves the ATen op and no eager shim runs
+    inside it.
+    """
+    import functools
+
+    import torch
+
+    calls = []
+    raw = torch._C._VariableFunctions.arange
+
+    @functools.wraps(raw)
+    def torchada_style(*args, **kwargs):
+        calls.append(("torchada", args))
+        return raw(*args, **kwargs)
+
+    def make_te_wrapper():
+        # MT-TE pattern, but the captured original is torchada's wrapper.
+        original_arange = torchada_style
+
+        def patched_arange(*args, **kwargs):
+            calls.append(("te", args))
+            return original_arange(*args, **kwargs)
+
+        return patched_arange
+
+    def scripted_probe(n: int):
+        return torch.arange(n) + 1
+
+    wrapper = make_te_wrapper()
+    wrapper.__module__ = "transformer_engine.musa"
+    assert _transformer_engine._reaches_aten_factory(raw, torch, "arange") is True
+    assert (
+        _transformer_engine._reaches_aten_factory(torchada_style, torch, "arange")
+        is True
+    )
+    previous = torch.arange
+    monkeypatch.setattr(torch, "arange", wrapper)
+    script_before = torch.jit.script
+    try:
+        assert _transformer_engine._install_jit_script_compat() is True
+        assert torch.jit.script(scripted_probe)(3).tolist() == [1, 2, 3]
+        # The graph called the ATen op; neither eager shim ran inside it.
+        assert calls == []
+        assert torch.arange is wrapper
+    finally:
+        _transformer_engine._uninstall_jit_script_compat()
+        assert torch.jit.script is script_before
+        torch.arange = previous
+
+
+def test_factory_shim_alias_declines_unrelated_capture(monkeypatch):
+    """A wrapper not delegating to the real ATen factory gets no alias.
+
+    The guard never guesses: with the capture unrelated, the compiler still
+    rejects the untyped wrapper (the vendor behavior the shim exists for),
+    instead of aliasing an arbitrary callable to ``aten::arange``.
+    """
+    import torch
+
+    def unrelated(*args, **kwargs):  # pragma: no cover - never executed
+        return None
+
+    def make_te_wrapper():
+        original_arange = unrelated
+
+        def patched_arange(*args, **kwargs):
+            return original_arange(*args, **kwargs)
+
+        return patched_arange
+
+    def scripted_probe(n: int):
+        return torch.arange(n) + 1
+
+    wrapper = make_te_wrapper()
+    wrapper.__module__ = "transformer_engine.musa"
+    assert (
+        _transformer_engine._reaches_aten_factory(unrelated, torch, "arange") is False
+    )
+    previous = torch.arange
+    monkeypatch.setattr(torch, "arange", wrapper)
+    try:
+        assert _transformer_engine._install_jit_script_compat() is True
+        with pytest.raises(torch.jit.frontend.NotSupportedError):
+            torch.jit.script(scripted_probe)
+    finally:
+        _transformer_engine._uninstall_jit_script_compat()
+        torch.arange = previous
+
+
 def test_factory_shim_compat_end_to_end_subprocess():
     """With auto-activation, eager torch.jit.script over factories survives TE."""
     pytest.importorskip("torch_musa")

@@ -105,6 +105,51 @@ _jit_script_owned: tuple[Any, Any, Any] | None = None
 _jit_compile_lock = RLock()
 _FACTORY_NAMES = ("tensor", "zeros", "ones", "empty", "rand", "arange", "empty_like")
 
+#: Upper bound on wrapper layers the alias guard walks through. The real MUSA
+#: stack stacks two device-translation shims on one factory (torchada below
+#: MT-TE); the bound only limits the search, it never loosens the terminal
+#: identity check against the real ATen function.
+_FACTORY_CHAIN_MAX_WRAPPERS = 32
+
+
+def _reaches_aten_factory(candidate: Any, torch_module: Any, name: str) -> bool:
+    """Does the captured callable delegate to the real ATen factory function?
+
+    The eager factory chain is layered: this project's torch.cuda compat layer
+    (torchada) wraps ``torch._C._VariableFunctions.<name>`` first, and MT-TE's
+    ``patched_<name>`` then captures *that* wrapper, so the captured original
+    is no longer the raw ATen function. Accept a bounded walk over plain-
+    function closure cells that literally reaches the ATen function; anything
+    else declines, so the alias is never guessed for unrelated callables.
+    """
+    import types
+
+    aten = getattr(torch_module._C._VariableFunctions, name, None)
+    if aten is None:
+        return False
+    frontier = [candidate]
+    visited: set[int] = set()
+    while frontier:
+        if len(visited) >= _FACTORY_CHAIN_MAX_WRAPPERS:
+            return False
+        advancing = []
+        for obj in frontier:
+            if obj is aten:
+                return True
+            key = id(obj)
+            if key in visited or not isinstance(obj, types.FunctionType):
+                continue
+            visited.add(key)
+            for cell in obj.__closure__ or ():
+                try:
+                    value = cell.cell_contents
+                except ValueError:  # Empty cell: nothing to delegate to.
+                    continue
+                if callable(value):
+                    advancing.append(value)
+        frontier = advancing
+    return False
+
 
 @contextmanager
 def _script_factory_aliases(torch_module):
@@ -159,9 +204,7 @@ def _script_factory_aliases(torch_module):
                     original = cell.cell_contents
                 except ValueError:  # Empty closure cell: not this vendor contract.
                     continue
-                if original is not getattr(
-                    torch_module._C._VariableFunctions, name, None
-                ):
+                if not _reaches_aten_factory(original, torch_module, name):
                     continue
                 key = id(wrapper)
                 previous = table.get(key, missing)
@@ -542,22 +585,29 @@ PATCHES = (
             "ms-swift hits this on ``import swift.megatron`` because "
             "swift.model imports sequence_parallel/zigzag_ring_attn, whose "
             "module-level @torch.jit.script compiles torch.arange calls "
-            "before Megatron is ever imported. The wrappers themselves are "
-            "load-bearing: swift, mcore-bridge and Megatron-Core pass eager "
-            "``device='cuda'`` strings to factory calls on the training path."
+            "before Megatron is ever imported. With this project's torch.cuda "
+            "compat layer active, MT-TE's wrappers capture torchada's factory "
+            "wrapper instead of the raw ATen function, so the alias guard "
+            "must verify the whole shim chain, not a single layer. The "
+            "wrappers themselves are load-bearing: swift, mcore-bridge and "
+            "Megatron-Core pass eager ``device='cuda'`` strings to factory "
+            "calls on the training path."
         ),
         strategy=(
             "Only for the installed MUSA TE fork, own torch.jit.script at the "
             "TE import boundary. During scripting, register the seven known "
             "TE wrappers as their ATen builtins in TorchScript's compiler "
-            "table, serialize nested/concurrent registration and undo owned "
-            "entries even on compile failure. Eager torch factories are never "
-            "rebound, including during compilation. Preserve caller-frame "
-            "resolution and restore script only by exact identity on undo. "
-            "Scripted devices retain ATen semantics: use actual device "
-            "objects, not CUDA string literals expecting eager translation. "
-            "Declines when the installed TE no longer wraps factory "
-            "functions (source probe)."
+            "table, accepting only wrappers whose captured original provably "
+            "delegates to the real ATen function -- directly or through a "
+            "bounded chain of further eager shims such as torchada's factory "
+            "wrappers. Serialize nested/concurrent registration and undo "
+            "owned entries even on compile failure. Eager torch factories "
+            "are never rebound, including during compilation. Preserve "
+            "caller-frame resolution and restore script only by exact "
+            "identity on undo. Scripted devices retain ATen semantics: use "
+            "actual device objects, not CUDA string literals expecting eager "
+            "translation. Declines when the installed TE no longer wraps "
+            "factory functions (source probe)."
         ),
         upstream="transformer_engine/musa/__init__.py:patch_after_import_torch",
         remove_when=(

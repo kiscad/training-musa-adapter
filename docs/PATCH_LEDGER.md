@@ -39,7 +39,7 @@ core_v0.17/0.18/0.19 分支逐目标校准（接口在边界处明显变化的�
 | fp8 norm-linear（1/2 卡，TP/SP，checkpoint 分片） | ✅ TE_PASS（16 项） |
 | RoPE 融合 | ✅ ROPE_PASS（8 项，真实 apex 核） |
 | GDN TileLang | ✅ SSM_PASS：分发位级一致、与 FLA 前向/反向一致、fla-only 降级位级一致、DISABLE 新进程恢复 |
-| factory-shim torchscript | ✅ 子进程端到端（ms-swift zigzag_ring_attn 形态） |
+| factory-shim torchscript | ✅ 子进程端到端（ms-swift zigzag_ring_attn 形态）；✅ [09-23 链式 shim 修复](REVIEW_2026-09-23.md)（torchada 0.1.86 在下、TE 在上，`import swift.megatron` 真实链） |
 
 ## 逐 ID 状态
 
@@ -103,7 +103,7 @@ core_v0.17/0.18/0.19 分支逐目标校准（接口在边界处明显变化的�
 | `megatron.te.quantized-model-init.delayed-compat` | `patches/transformer_engine.py` | 已实现 | ✅单元 |
 | `megatron.te.cpu-offload-context.signature-dispatch` | 同上 | 已实现 | ✅单元 |
 | `megatron.te.grouped-linear.mem-monitor-compat` | 同上 | 已实现 | ✅单元 |
-| `megatron.te.factory-shim.torchscript-compat` | 同上 | 已实现（已验证） | ✅子进程端到端 |
+| `megatron.te.factory-shim.torchscript-compat` | 同上 | 已实现（已验证） | ✅子进程端到端；✅单元（[09-23 链式 shim 修复](REVIEW_2026-09-23.md)：torchada 层在 TE 之下时别名走查到真实 ATen 函数，真实 `import swift.megatron` 链验证） |
 | `megatron.te.utils-module.safe-seed` | 同上 | 已实现 | ✅单元 |
 | `megatron.te.make-weak-ref.graph-compat` | `patches/megatron/cuda_graphs.py` | 已实现 | ✅单元；⚠️ cuda graph 需 torch_musa>2.9，本栈 2.7.1 硬件验证延期 |
 | `megatron.te.telinear.delayed-init` | `patches/megatron/delayed_wgrad.py` | 已实现 | ✅单元（含 requires 门控） |
