@@ -17,7 +17,7 @@ from __future__ import annotations
 
 __all__ = ["PATCHES", "MODULES", "SUITES", "PATCH_SUITES"]
 
-from . import platform, transformer_engine
+from . import deepspeed, peft, platform, transformer_engine
 from .mcore_bridge import ssm as mcore_bridge_ssm
 from .megatron import (
     attention,
@@ -58,6 +58,8 @@ MODULES = (
     ssm,
     mcore_bridge_ssm,
     rms_norm,
+    peft,
+    deepspeed,
 )
 
 PATCHES = tuple(patch for module in MODULES for patch in module.PATCHES)
@@ -87,6 +89,8 @@ SUITES = {
     ),
     "transformer_engine": (transformer_engine,),
     "transformers": (rms_norm,),
+    "peft": (peft,),
+    "deepspeed": (deepspeed,),
     "mcore_bridge": (mcore_bridge_ssm,),
 }
 

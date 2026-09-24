@@ -136,6 +136,34 @@ core_v0.17/0.18/0.19 分支逐目标校准（接口在边界处明显变化的�
 | `megatron.offloading.resident-parameters` | `patches/megatron/offloading.py` | 已实现 | ✅单元 |
 | `transformer_engine.saved-tensors.offload-markers` | 同上 | 已实现 | ✅单元 |
 
+### peft
+
+| ID | 目标位置 | 状态 | 验证 |
+|---|---|---|---|
+| `peft.lora.torchao-probe.version-compat` | `patches/peft.py`（`peft.import_utils:is_torchao_available`） | 已实现 | ✅单元（含门控边界与异常透传）；✅LoRA SFT 训练入口（Qwen2.5-0.5B，1×MUSA，torchao 0.9.0 + peft 0.19.1 真实冲突链） |
+
+门控证据（peft sdists 0.14.0/0.15.2/0.16.0/0.17.1/0.18.0/0.19.0/0.20.0/0.21.0，
+证据副本在任务目录 `upstream-src/peft-*/`）：`is_torchao_available` 自 0.14.0 引入即对
+低于最低版本的 torchao 抛 ImportError，但 0.14.0-0.18.x 的最低版本是 0.4.0；0.19.0 起
+最低版本跳到 0.16.0，0.19.0-0.21.0 的消息与签名一致。本环境 torchao 0.9.0（社区构建）
+能通过 0.14-0.18 的门、被 0.19+ 的门拒绝，而 `peft/tuners/lora/torchao.py:dispatch_torchao`
+对每个 LoRA 目标先调用该探针再检查 weight 类型，因此 `get_peft_model` 全量崩溃。
+补丁范围 `>=0.19,<0.22`：0.22 尚未发布，上界是保守核查边界，不是已证实的不兼容点。
+
+### deepspeed
+
+| ID | 目标位置 | 状态 | 验证 |
+|---|---|---|---|
+| `deepspeed.zero.grad-norm.fp32` | `patches/deepspeed.py`（`deepspeed.runtime.zero.utils:get_norm_dtype`） | 已实现 | ✅单元（CUDA 保持/MUSA 降级/门控边界）；✅ZeRO-3 LoRA SFT 训练入口（Qwen2.5-0.5B，2×MUSA，社区 deepspeed 0.19.7） |
+
+门控证据（deepspeed sdists 0.17.2/0.18.9/0.19.7，证据副本在任务目录
+`upstream-src/ds-*/`）：`get_norm_dtype` 0.19.0 引入（0.17.2/0.18.9 无此函数），
+0.19.7 的 CUDA accelerator `is_fp64_supported()` 恒 True 而 torch_musa 无 fp64 norm
+kernel，ZeRO-3 首个 optimizer step 在 `get_grad_norm_direct` 崩溃；MPS accelerator
+`is_fp64_supported() -> False` 是上游对「无可用 fp64 设备」的既有先例。
+补丁范围 `>=0.19,<0.20`：0.20 尚未发布，上界为保守核查边界。
+deepspeed 采用社区版 0.19.7（用户指令：弃用 vendor fork `/home/DeepSpeed`）。
+
 ## 已知缺口（如实记录）
 
 1. `transformer_engine.dot-product-attention.capability-dispatch`（TE 原生 DPA
